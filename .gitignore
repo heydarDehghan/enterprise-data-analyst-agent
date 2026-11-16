@@ -1,0 +1,53 @@
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Temporary execution files and local runtime state
+tmp/
+temp/
+*.tmp
+*.temp
+runtime/
+state/
+*.pid
+*.sock
+
+# Generated charts and analysis artifacts
+charts/
+artifacts/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.html
+
+# Local logs
+logs/
+*.log

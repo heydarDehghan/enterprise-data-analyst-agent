@@ -1,0 +1,1 @@
+"""Kamidso Lite application package."""

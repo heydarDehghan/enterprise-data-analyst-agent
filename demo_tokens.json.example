@@ -1,0 +1,10 @@
+{
+  "demo-alpha": {
+    "db": "alpha.db",
+    "tickets": "alpha_tickets.csv"
+  },
+  "demo-beta": {
+    "db": "beta.db",
+    "tickets": "beta_tickets.csv"
+  }
+}
