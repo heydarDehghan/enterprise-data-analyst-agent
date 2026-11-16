@@ -41,6 +41,7 @@ class ConversationSnapshot:
     turns: list[ConversationTurn]
     artifacts: list[ArtifactMetadata]
     evidence: list[RecordedToolResult]
+    preceding_successful_question: str | None = None
 
 
 def _tenant_key(tenant: TenantContext) -> str:
@@ -153,6 +154,7 @@ class SQLiteConversationStore:
         turns: list[ConversationTurn] = []
         evidence: list[RecordedToolResult] = []
         scope = EvidenceScope(key, conversation_id)
+        turn_messages: list[dict] = []
         for row in stored_turns:
             turn_messages = json.loads(row["messages_json"])
             trace = [ToolTrace.model_validate(item) for item in json.loads(row["trace_json"])]
@@ -163,12 +165,22 @@ class SQLiteConversationStore:
             ))
             if row["status"] == "success":
                 evidence.extend(recover_turn_evidence(scope, row["proof_json"], turn_messages, trace))
+
+        preceding_question = None
+        if turns and turns[-1].status == "success" and isinstance(turn_messages, list) and turn_messages:
+            original = turn_messages[0]
+            if isinstance(original, dict) and original.get("role") == "user":
+                content = original.get("content")
+                if isinstance(content, str):
+                    preceding_question = content
+
         return ConversationSnapshot(
             messages=messages,
             turns=turns,
             artifacts=[ArtifactMetadata.model_validate(json.loads(row["metadata_json"]))
                        for row in stored_artifacts],
             evidence=evidence,
+            preceding_successful_question=preceding_question,
         )
 
     def save_turn(

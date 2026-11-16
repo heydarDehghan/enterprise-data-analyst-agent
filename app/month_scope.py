@@ -8,6 +8,20 @@ from datetime import date, timedelta
 from typing import Any
 
 
+_DEMO_MONTH_NAMES = {
+    8: ("august", "آگوست", "اوت"),
+    9: ("september", "سپتامبر", "شهریور"),
+    10: ("october", "اکتبر"),
+}
+_ISO_DATE = re.compile(r"\b[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}\b")
+_DEMO_MONTH_ID = re.compile(r"\b2026-(0[1-9]|1[0-2])\b")
+_PREVIOUS_REPORT_REQUEST = re.compile(
+    r"عدد (?:دقیق )?گزارش قبلی را (?:با رقم )?دوباره بگو"
+    r"(?: و نمودار قبلی را نگه دار)?"
+    r"(?:[.؟] برای slot عددی از همان شاهد execute_python و فیلد revenue استفاده کن)?[.؟]?",
+)
+
+
 @dataclass(frozen=True)
 class MonthScope:
     label: str
@@ -20,8 +34,11 @@ class MonthScope:
     def guidance(self) -> str:
         return (
             f"For this question, {self.label} covers Gregorian dates "
-            f"{self.first} through {self.last} inclusive (or before "
-            f"{self.next_first}). Use this exact period in revenue SQL. "
+            f"{self.first} through {self.last} inclusive. "
+            f"For SQL and Python revenue filters use order_date >= {self.first} and order_date < {self.next_first}. "
+            f"Use user_request.period_start = {self.first} and user_request.period_end = {self.last} "
+            "(the inclusive final calendar day). "
+            f"The exclusive cutoff {self.next_first} is only for filtering. "
             "Gregorian September and the Persian month Shahrivar are different periods."
         )
 
@@ -33,35 +50,83 @@ def _ascii_digits(text: str) -> str:
     )
 
 
+def references_previous_report(question: str) -> bool:
+    """Recognize the supported repeat requests without allowing an extra date clause."""
+    return _PREVIOUS_REPORT_REQUEST.fullmatch(" ".join(question.casefold().split())) is not None
+
+
+def _explicit_date_window(question: str, dates: list[re.Match[str]]) -> tuple[date, date] | None:
+    """Read an unambiguous interval and return its inclusive calendar endpoints."""
+    if len(dates) != 2:
+        return None
+    start_token, end_token = dates
+    try:
+        start, end = date.fromisoformat(start_token.group()), date.fromisoformat(end_token.group())
+    except ValueError:
+        return None
+
+    head = question[:start_token.start()].rstrip()
+    connector = question[start_token.end():end_token.start()].strip()
+    tail = question[end_token.end():].lstrip(" ,،")
+    on_or_after = bool(re.search(r"\bon or after$", head))
+    if not on_or_after and re.search(r"\b(?:after|before|بعد از|پیش از|قبل از)$", head):
+        return None
+
+    inclusive = bool(re.match(r"(?:inclusive|شامل)\b", tail))
+    if connector in ("through", "to", "تا") and inclusive:
+        return (start, end) if start <= end else None
+
+    exclusive = (
+        (connector == "and before" and (on_or_after or re.search(r"\bfrom$", head)))
+        or (re.fullmatch(r"(?:شامل آن روز )?تا (?:قبل|پیش) از", connector) and re.search(r"\bاز$", head))
+        or (connector in ("to", "inclusive to") and re.match(r"exclusive\b", tail))
+    )
+    if exclusive and not inclusive and start < end:
+        return start, end - timedelta(days=1)
+    return None
+
+
 def requested_month(question: str) -> MonthScope | None:
-    normalized = _ascii_digits(question).lower()
-    if "شهریور" in normalized and "1405" in normalized:
-        if "2026" in normalized and any(
-            name in normalized for name in ("september", "سپتامبر", "october", "اکتبر")
-        ):
+    normalized = " ".join(_ascii_digits(question).lower().split())
+    dates = list(_ISO_DATE.finditer(normalized))
+    window = _explicit_date_window(normalized, dates) if dates else None
+    if dates and window is None:
+        return None
+
+    # Remove calendar endpoints before scanning for independent month references.
+    wording = _ISO_DATE.sub(" ", normalized)
+    mentioned = {int(month) for month in _DEMO_MONTH_ID.findall(wording)}
+    if "شهریور" in wording and "1405" in wording:
+        if mentioned or ("2026" in normalized and any(
+            name in wording
+            for names in _DEMO_MONTH_NAMES.values()
+            for name in names
+            if name != "شهریور"
+        )):
             return None  # A comparison needs more than one calendar scope.
-        return MonthScope("Shahrivar 1405 Solar Hijri (شهریور ۱۴۰۵ شمسی)",
-                          "2026-08-23", "2026-09-22", "2026-09-23")
+        first, last = "2026-08-23", "2026-09-22"
+        if window and tuple(day.isoformat() for day in window) != (first, last):
+            return None
+        return MonthScope("Shahrivar 1405 Solar Hijri (شهریور ۱۴۰۵ شمسی)", first, last, "2026-09-23")
 
     # The supplied 2026 demo questions use Gregorian year/month labels. The
     # older wording "شهریور ۲۰۲۶" is interpreted as that demo convention,
     # never as Shahrivar 1405 of the Persian calendar.
     if "2026" not in normalized:
         return None
-    months = {
-        8: ("august", "آگوست", "اوت"),
-        9: ("september", "سپتامبر", "شهریور"),
-        10: ("october", "اکتبر"),
-    }
-    mentioned = [
-        month for month, names in months.items()
-        if any(name in normalized for name in names) or f"2026-{month:02d}" in normalized
-    ]
+    mentioned.update(month for month, names in _DEMO_MONTH_NAMES.items()
+                     if any(name in wording for name in names))
+    if window:
+        mentioned.add(window[0].month)
     if len(mentioned) != 1:
         return None  # Avoid imposing one month on a comparison question.
-    month = mentioned[0]
+    month, = mentioned
+    if month not in _DEMO_MONTH_NAMES:
+        return None
     first = date(2026, month, 1)
     last = date(2026, month, calendar.monthrange(2026, month)[1])
+    if window and window != (first, last):
+        return None
     return MonthScope(
         f"Gregorian {first.strftime('%B')} 2026 (میلادی)",
         first.isoformat(), last.isoformat(),

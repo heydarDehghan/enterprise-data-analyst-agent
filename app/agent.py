@@ -12,7 +12,7 @@ import httpx
 from app.agent_tools import PYTHON_TOOL, TOOLS
 from app.config import load_llm_config
 from app.evidence_presentation import SLOT_EXAMPLES, evidence_block
-from app.month_scope import needs_month_scope, requested_month, sql_matches_month
+from app.month_scope import needs_month_scope, references_previous_report, requested_month, sql_matches_month
 from app.observations import observe
 from app.schemas import ArtifactMetadata, ChatRequest, ChatResponse, ToolTrace
 from app.sql_evidence import sql_provenance
@@ -182,6 +182,7 @@ class AgentLoop:
         raise ValueError("Unknown tool")
 
     def run(self, request: ChatRequest) -> ChatResponse:
+        preceding_question = None
         if self._state_store is None:
             conversation_id = request.conversation_id or uuid4().hex
             history: list[dict[str, Any]] = []
@@ -195,11 +196,14 @@ class AgentLoop:
             history = snapshot.messages
             prior_artifacts = snapshot.artifacts
             prior_evidence = snapshot.evidence
+            preceding_question = snapshot.preceding_successful_question
 
         trace_id = self._trace_id_factory()
         observe("turn", trace_id=trace_id, conversation_id=conversation_id,
                 max_calls=self._max_llm_calls, max_total_tokens=self._max_total_tokens)
         month_scope = requested_month(request.question)
+        if month_scope is None and preceding_question and references_previous_report(request.question):
+            month_scope = requested_month(preceding_question)
         context = GroundingContext(
             EvidenceScope(self._tenant.state_key, conversation_id),
             getattr(self._tenant, "display_label", None),

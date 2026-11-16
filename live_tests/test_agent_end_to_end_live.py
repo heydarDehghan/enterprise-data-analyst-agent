@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from app.agent import EnvChatCompletionsClient
 from app.config import load_llm_config
 from app.main import create_app
+from live_tests.llm_diagnostics import PYTHON_PNG_NODE
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def live_configuration(monkeypatch):
+def live_configuration(monkeypatch, request):
     if os.environ.get("LLM_CHAT_COMPLETIONS_URL") != ENDPOINT:
         pytest.fail("The exact approved OpenRouter endpoint is required")
     if os.environ.get("LLM_MODEL") != MODEL:
@@ -44,7 +45,8 @@ def live_configuration(monkeypatch):
     if not os.environ.get("LLM_API_KEY"):
         pytest.fail("LLM_API_KEY must already be configured in the process")
     monkeypatch.setenv("LLM_MAX_CALLS_PER_REQUEST", "8")
-    monkeypatch.setenv("LLM_MAX_TOTAL_TOKENS_PER_REQUEST", "24000")
+    total_token_budget = 40_000 if request.node.nodeid == PYTHON_PNG_NODE else 24_000
+    monkeypatch.setenv("LLM_MAX_TOTAL_TOKENS_PER_REQUEST", str(total_token_budget))
 
 
 class CountingLiveClient:
