@@ -150,7 +150,7 @@ class _Recorder:
             self._errors.append({"operation": operation, "error": type(exc).__name__})
             return None
 
-    def observe(self, event, values):
+    def observe(self, event, **values):
         self._guard(event, self._observe, event, values)
 
     def _observe(self, event, values):
@@ -198,6 +198,8 @@ class _Recorder:
             self._slot.update(values)
         elif event == "grounding_end":
             self._grounding.update(values)
+        elif event == "repair":
+            self._grounding.setdefault("repair", {}).update(values)
 
     def _body(self, raw):
         self._body_bytes += len(raw)

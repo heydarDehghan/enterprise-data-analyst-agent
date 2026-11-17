@@ -5,6 +5,7 @@ import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -48,6 +49,10 @@ def _tenant_key(tenant: TenantContext) -> str:
     if not isinstance(tenant, TenantContext):
         raise TypeError("Authenticated tenant context required")
     return tenant.state_key
+
+
+def _reference_digest(reference: str) -> bytes:
+    return sha256(reference.encode("utf-8", errors="surrogatepass")).digest()
 
 
 class SQLiteConversationStore:
@@ -104,6 +109,29 @@ class SQLiteConversationStore:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(turns)")}
             if "failure_code" not in columns:
                 connection.execute("ALTER TABLE turns ADD COLUMN failure_code TEXT")
+            self._initialize_reference_index(connection)
+
+    @staticmethod
+    def _initialize_reference_index(connection: sqlite3.Connection) -> None:
+        # Populate once from existing server-authored tool message IDs. A later
+        # repair consults only the digest index, with no tenant or transcript lookup.
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'issued_tool_references'"
+        ).fetchone()
+        if existing:
+            return
+        connection.execute("CREATE TABLE issued_tool_references (digest BLOB PRIMARY KEY) WITHOUT ROWID")
+        references = connection.execute("""
+            SELECT json_extract(message.value, '$.tool_call_id')
+            FROM turns, json_each(CASE WHEN json_valid(messages_json) THEN messages_json ELSE '[]' END) AS message
+            WHERE message.type = 'object' AND json_extract(message.value, '$.role') = 'tool'
+              AND json_type(message.value, '$.tool_call_id') = 'text'
+        """)
+        connection.executemany(
+            "INSERT OR IGNORE INTO issued_tool_references (digest) VALUES (?)",
+            ((_reference_digest(reference),) for (reference,) in references),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)
@@ -115,6 +143,25 @@ class SQLiteConversationStore:
     def _require_id(conversation_id: str) -> None:
         if not isinstance(conversation_id, str) or not _OPAQUE_ID.fullmatch(conversation_id):
             raise ConversationNotFoundError("Conversation not found")
+
+    def record_tool_reference(self, reference: str) -> None:
+        """Reserve an ID before exposing its tool result to a model."""
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO issued_tool_references (digest) VALUES (?)",
+                (_reference_digest(reference),),
+            )
+
+    def reference_is_unissued(self, reference: str) -> bool:
+        """A deny-only membership check. This index never resolves evidence."""
+        try:
+            with closing(self._connect()) as connection:
+                return connection.execute(
+                    "SELECT 1 FROM issued_tool_references WHERE digest = ?",
+                    (_reference_digest(reference),),
+                ).fetchone() is None
+        except sqlite3.Error:
+            return False
 
     def create_conversation(self, tenant: TenantContext) -> str:
         key = _tenant_key(tenant)

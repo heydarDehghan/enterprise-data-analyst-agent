@@ -11,14 +11,14 @@ import httpx
 
 from app.agent_tools import PYTHON_TOOL, TOOLS
 from app.config import load_llm_config
-from app.evidence_presentation import SLOT_EXAMPLES, evidence_block
+from app.evidence_presentation import SLOT_EXAMPLES, advertises_address, evidence_block
 from app.month_scope import needs_month_scope, references_previous_report, requested_month, sql_matches_month
 from app.observations import observe
 from app.schemas import ArtifactMetadata, ChatRequest, ChatResponse, ToolTrace
 from app.sql_evidence import sql_provenance
 from app.structured_grounding import (
     EvidenceScope, GroundingContext, RecordedToolResult,
-    StructuredGroundingError, validate_and_render,
+    StructuredGroundingError, UnknownEvidenceReference, validate_and_render,
 )
 
 
@@ -40,6 +40,12 @@ _SYSTEM = (
     "If the list is truncated or a field is unavailable, request a smaller or fresh result. "
     "If evidence is insufficient, write Persian prose to explain this and use an empty slots "
     "object when needed. The backend renders your exact template from verified values."
+)
+
+_ANSWER_REPAIR = (
+    "Regenerate the final answer as a fresh JSON object with exactly template and slots. "
+    "Use only exact evidence_ref values already advertised in KAMIDSO_EVIDENCE_V1.tools "
+    "and their verified fields. Return the final JSON in content without calling any tools."
 )
 
 
@@ -237,6 +243,7 @@ class AgentLoop:
         used_tokens = 0
         invalid_month_scope = False
         grounding_started = False
+        repair_error: UngroundedAnswerError | None = None
         try:
             while True:
                 if self._max_llm_calls is not None and llm_calls >= self._max_llm_calls:
@@ -248,18 +255,22 @@ class AgentLoop:
                     record for record in prior_evidence
                     if prior_ids[record.call_id] == 1 and record.call_id not in current_ids
                 ] + [record for record in evidence if record.call_id not in prior_ids]
-                outbound = [
-                    {"role": "system", "content": messages[0]["content"] + "\n" + evidence_block(context, eligible)},
-                    *messages[1:],
-                ]
+                manifest = evidence_block(context, eligible)
+                system = messages[0]["content"] + "\n" + manifest
+                if repair_error is not None:
+                    system += "\n" + _ANSWER_REPAIR
+                outbound = [{"role": "system", "content": system}, *messages[1:]]
                 try:
                     llm_calls += 1
                     observe("provider_start", index=llm_calls)
-                    completion = self._llm.create(messages=outbound, tools=self._tools)
+                    completion = self._llm.create(messages=outbound, tools=[] if repair_error is not None else self._tools)
                     choice = completion["choices"][0]
                     message = choice["message"]
                     llm_failures = 0
                 except Exception:
+                    if repair_error is not None:
+                        observe("repair", provider_outcome="provider_error")
+                        raise repair_error from None
                     llm_failures += 1
                     if llm_failures > 2:
                         raise AgentOperationFailed("LLM operation failed", trace) from None
@@ -276,20 +287,53 @@ class AgentLoop:
                     if used_tokens >= self._max_total_tokens:
                         raise ProviderBudgetExceeded("LLM token budget exceeded", trace)
 
+                if repair_error is not None and (choice.get("finish_reason") != "stop"
+                                                 or not isinstance(message, dict) or message.get("tool_calls")):
+                    observe("repair", provider_outcome="invalid_final_response")
+                    raise repair_error from None
                 if choice["finish_reason"] == "stop":
                     answer = message.get("content")
                     grounding_started = True
-                    observe("grounding_start", raw_final_content=answer)
-                    if not isinstance(answer, str) or not answer.strip():
-                        raise AgentOperationFailed("LLM returned no answer", trace)
-                    if invalid_month_scope:
-                        raise UngroundedAnswerError("invalid_date_range", trace)
+                    observe("grounding_start", raw_final_content=answer, is_repair=repair_error is not None)
                     try:
-                        answer = validate_and_render(answer, context=context, tool_results=eligible)
+                        if not isinstance(answer, str) or not answer.strip():
+                            if repair_error is None:
+                                raise AgentOperationFailed("LLM returned no answer", trace)
+                            raise StructuredGroundingError("missing_final_content")
+                        if invalid_month_scope:
+                            raise StructuredGroundingError("invalid_date_range")
+                        answer = validate_and_render(
+                            answer, context=context, tool_results=eligible, check_reference_repair=repair_error is None,
+                        )
+                        if not re.search(r"[؀-ۿ]", answer):
+                            raise StructuredGroundingError("non_persian")
                     except StructuredGroundingError as exc:
-                        raise UngroundedAnswerError(exc.reason_code, trace) from None
-                    if not re.search(r"[؀-ۿ]", answer):
-                        raise UngroundedAnswerError("non_persian", trace)
+                        observe("grounding_end", rendered_answer=None, rejection_reason=exc.reason_code)
+                        grounding_started = False
+                        if repair_error is not None:
+                            raise repair_error from None
+                        rejected = UngroundedAnswerError(exc.reason_code, trace)
+                        if isinstance(exc, UnknownEvidenceReference):
+                            reference = json.dumps(exc.reference, ensure_ascii=False)[1:-1]
+                            eligible_for_repair = (
+                                exc.candidate is not None and exc.reference not in prior_ids
+                                and exc.reference not in current_ids
+                                and advertises_address(manifest, exc.candidate)
+                                and reference not in _ANSWER_REPAIR
+                                and reference not in json.dumps(outbound, ensure_ascii=False)
+                                and (self._state_store is None
+                                     or self._state_store.reference_is_unissued(exc.reference))
+                            )
+                            attempted = eligible_for_repair and (
+                                self._max_llm_calls is None or llm_calls < self._max_llm_calls
+                            )
+                            observe("repair", reason="unknown_evidence_reference",
+                                    eligible=attempted, attempted=attempted,
+                                    blocked_by_call_limit=eligible_for_repair and not attempted)
+                            if attempted:
+                                repair_error = rejected
+                                continue
+                        raise rejected from None
                     observe("grounding_end", rendered_answer=answer, rejection_reason=None)
                     messages.append({"role": "assistant", "content": answer})
                     if self._state_store is not None:
@@ -313,6 +357,8 @@ class AgentLoop:
                     call_id = tool_call.get("id")
                     if type(call_id) is not str or not call_id.strip():
                         raise AgentOperationFailed("Invalid LLM tool call ID", trace)
+                    if self._state_store is not None:
+                        self._state_store.record_tool_reference(call_id)
                     raw = tool_call.get("function", {}).get("arguments", "")
                     signature = ("invalid", name if isinstance(name, str) else "unknown")
                     fields, window = {}, None
@@ -358,6 +404,8 @@ class AgentLoop:
                     if failures[signature] > 2:
                         raise AgentOperationFailed("Tool operation failed after retries", trace)
         except AgentLoopError as exc:
+            if repair_error is not None and isinstance(exc, ProviderBudgetExceeded):
+                observe("repair", provider_outcome="budget_exceeded")
             if grounding_started:
                 observe("grounding_end", rendered_answer=None,
                         rejection_reason=(exc.reason_code if isinstance(exc, UngroundedAnswerError)

@@ -4,7 +4,9 @@ import json
 import re
 from collections.abc import Iterable
 
-from app.structured_grounding import GroundingContext, RecordedToolResult, citable_fields, evidence_registry
+from app.structured_grounding import (
+    EvidenceAddress, GroundingContext, RecordedToolResult, citable_fields, evidence_registry,
+)
 
 
 _EVIDENCE_PREFIX = "KAMIDSO_EVIDENCE_V1 "
@@ -100,3 +102,14 @@ def evidence_block(context: GroundingContext, records: Iterable[RecordedToolResu
             break
     # _compact emits ASCII, so character and byte lengths are equal.
     return _EVIDENCE_PREFIX + _compact(manifest)
+
+
+def advertises_address(block: str, address: EvidenceAddress) -> bool:
+    """Check an address against the bounded manifest actually sent to the model."""
+    manifest = json.loads(block.removeprefix(_EVIDENCE_PREFIX))
+    return any(
+        (field["evidence_field"], field.get("row"), (field["type"], field.get("unit")))
+        == (address.field, address.row, address.kind.value)
+        for tool in manifest["tools"] if tool["evidence_ref"] == address.reference
+        for field in tool["fields"]
+    )

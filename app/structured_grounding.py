@@ -26,6 +26,8 @@ _NUMBER = re.compile(
 )
 _MAX_NUMBER_LENGTH = 128
 _MAX_JSON_LENGTH = 65_536
+_PERSIAN = re.compile(r"[؀-ۿ]")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 class StructuredGroundingError(ValueError):
@@ -61,6 +63,23 @@ class FieldKind(Enum):
     SCALAR = ("numeric", "scalar")
     DATE = ("date", None)
     IDENTIFIER = ("identifier", None)
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAddress:
+    reference: str
+    field: str
+    row: int | None
+    kind: FieldKind
+
+
+class UnknownEvidenceReference(StructuredGroundingError):
+    """Internal classification for an absent reference, never a rendered answer."""
+
+    def __init__(self, reference: str) -> None:
+        super().__init__("unsupported_number")
+        self.reference = reference
+        self.candidate: EvidenceAddress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,12 +342,18 @@ def _slot_value(
     if (type(ref) is not str or not ref or type(name) is not str or not name
             or ("row" in slot and (type(row) is not int or row < 0))):
         raise StructuredGroundingError("invalid_template")
-    record = records.get(ref)
+    if ref not in records:
+        raise UnknownEvidenceReference(ref)
+    record = records[ref]
     if record is None:
         raise StructuredGroundingError("unsupported_number")
 
     kind, actual = _tool_field(record, name, row, context.month)
     observe("authority", authoritative_value=actual, type=kind.value[0], unit=kind.value[1])
+    return _validated_field_value(slot, value, kind, actual)
+
+
+def _validated_field_value(slot: Mapping[str, object], value: str, kind: FieldKind, actual: object) -> str:
     if (slot["type"], slot.get("unit")) != kind.value:
         raise StructuredGroundingError("unsupported_number")
     if slot["type"] == "numeric":
@@ -344,11 +369,36 @@ def _slot_value(
     raise StructuredGroundingError("unsupported_number")
 
 
+def _repair_candidate(
+    slot: dict[str, object], records: Mapping[str, RecordedToolResult | None], month: MonthScope | None,
+) -> tuple[EvidenceAddress, str] | None:
+    # Determine uniqueness by field address and type before considering the proposed value.
+    address = (slot["evidence_field"], slot.get("row"), (slot["type"], slot.get("unit")))
+    candidate = None
+    for ref, record in records.items():
+        if record is None:
+            continue
+        for name, row, kind, actual in citable_fields(record, month):
+            if (name, row, kind.value) == address:
+                if candidate is not None:
+                    return None
+                candidate = (EvidenceAddress(ref, name, row, kind), actual)
+    if candidate is None:
+        return None
+    field, actual = candidate
+    try:
+        value = _validated_field_value(slot, slot["value"], field.kind, actual)
+    except StructuredGroundingError:
+        return None
+    return field, value
+
+
 def validate_and_render(
     answer_json: str,
     *,
     context: GroundingContext,
     tool_results: Iterable[RecordedToolResult] = (),
+    check_reference_repair: bool = False,
 ) -> str:
     """Replace validated slots in the original template using a single pass."""
     answer = _json_object(answer_json, "invalid_template")
@@ -366,19 +416,37 @@ def validate_and_render(
         raise StructuredGroundingError("invalid_template")
 
     records = evidence_registry(context.scope, tool_results)
-    values = {}
+    values: dict[str, str] = {}
+    pending: tuple[UnknownEvidenceReference, str, EvidenceAddress, str] | None = None
     for name, slot in slots.items():
         observe("slot_start", slot=name)
         try:
             values[name] = _slot_value(slot, context, records)
         except StructuredGroundingError as exc:
             observe("slot_end", decision="rejected", reason_code=exc.reason_code)
+            if pending is not None:
+                raise pending[0] from None
+            if check_reference_repair and isinstance(exc, UnknownEvidenceReference):
+                candidate = _repair_candidate(slot, records, context.month)
+                if candidate is not None:
+                    pending = (exc, name, *candidate)
+                    continue
             raise
         observe("slot_end", decision="accepted", reason_code=None)
+    if pending is not None:
+        unknown, unknown_slot, field, value = pending
+        # Check the same output limits without inserting the candidate into the rejected draft.
+        output_parts = parts[::2] + [values[name] for name in parts[1::2] if name != unknown_slot]
+        size = sum(map(len, output_parts)) + parts[1::2].count(unknown_slot) * len(value)
+        if (size <= _MAX_JSON_LENGTH
+                and not any(_SURROGATE.search(text) for text in (*output_parts, value))
+                and any(_PERSIAN.search(text) for text in (*output_parts, value))):
+            unknown.candidate = field
+        raise unknown from None
     parts[1::2] = [values[name] for name in parts[1::2]]
     if sum(map(len, parts)) > _MAX_JSON_LENGTH:
         raise StructuredGroundingError("invalid_template")
     rendered = "".join(parts)
-    if any("\ud800" <= char <= "\udfff" for char in rendered):
+    if _SURROGATE.search(rendered):
         raise StructuredGroundingError("invalid_template")
     return rendered
