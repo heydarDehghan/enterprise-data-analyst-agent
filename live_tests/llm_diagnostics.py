@@ -6,6 +6,7 @@ import os
 import re
 import stat
 from contextlib import contextmanager
+from contextvars import ContextVar
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -13,7 +14,7 @@ from uuid import uuid4
 import httpx
 
 from app.config import load_llm_config
-from app.observations import observer
+from app.observations import Observer, observer
 
 
 ALPHA_NODE = (
@@ -29,6 +30,9 @@ APPROVED_DIAGNOSTIC_NODES = frozenset({ALPHA_NODE, BETA_NODE, PYTHON_PNG_NODE})
 CAPTURE_PATH = "KAMIDSO_LLM_DIAGNOSTICS_PATH"
 _MAX_BYTES = 16 * 1024 * 1024
 _REDACTED = "[REDACTED]"
+_agent_observation_listener: ContextVar[Observer | None] = ContextVar(
+    "live_test_agent_observation_listener", default=None,
+)
 
 
 class DiagnosticCaptureError(RuntimeError):
@@ -132,6 +136,10 @@ class _Recorder:
         self._turn = {}
         self._provider_call_id = None
         self._in_provider = False
+        self._length_recovery = None
+        self._in_length_recovery = False
+        self._format_repair = None
+        self._in_format_repair = False
         self._grounding = None
         self._slots = {}
         self._slot = None
@@ -152,19 +160,43 @@ class _Recorder:
 
     def observe(self, event, **values):
         self._guard(event, self._observe, event, values)
+        listener = _agent_observation_listener.get()
+        if listener is not None:
+            self._guard("observation_listener", lambda: listener(event, **values))
 
     def _observe(self, event, values):
         if event == "turn":
             self._turn = {key: values[key] for key in ("conversation_id", "trace_id")}
+            self._length_recovery = None
+            self._format_repair = None
             self.data["runtime_limits"] = {
                 key: values[key] for key in ("max_calls", "max_total_tokens")
             }
         elif event == "provider_start":
             self._in_provider = True
+            self._in_length_recovery = values.get("length_recovery", False)
+            self._in_format_repair = values.get("format_repair", False)
             self._provider_call_id = None
             self._provider_index = values["index"]
+            if self._in_length_recovery and self._length_recovery is not None:
+                self._length_recovery["attempts"] = 1
         elif event == "provider_end":
             self._in_provider = False
+            self._in_length_recovery = False
+            self._in_format_repair = False
+        elif event == "length_completion":
+            self._length_recovery = {
+                **self._turn, "original_provider_call_id": self._provider_call_id,
+                "recovery_provider_call_id": None, "attempts": 0, **values,
+            }
+            self.data.setdefault("length_recovery", []).append(self._length_recovery)
+        elif event == "length_recovery_response" and self._length_recovery is not None:
+            self._length_recovery.update(values)
+        elif event == "turn_end":
+            if self._length_recovery is not None:
+                self._length_recovery.update(values)
+            if self._format_repair is not None:
+                self._format_repair.update(values)
         elif event == "tool":
             self.data["tool_executions"].append({
                 **self._turn, "provider_call_id": self._provider_call_id, **values,
@@ -200,6 +232,11 @@ class _Recorder:
             self._grounding.update(values)
         elif event == "repair":
             self._grounding.setdefault("repair", {}).update(values)
+        elif event == "format_repair":
+            if self._format_repair is None:
+                self._format_repair = {"recovery_provider_call_id": None}
+                self._grounding["format_repair"] = self._format_repair
+            self._format_repair.update(values)
 
     def _body(self, raw):
         self._body_bytes += len(raw)
@@ -216,6 +253,10 @@ class _Recorder:
 
     def _begin_attempt(self, request):
         self._provider_call_id = f"{self.data['run_id']}:{len(self.data['provider_calls']) + 1}"
+        if self._in_length_recovery and self._length_recovery is not None:
+            self._length_recovery["recovery_provider_call_id"] = self._provider_call_id
+        if self._in_format_repair and self._format_repair is not None:
+            self._format_repair["recovery_provider_call_id"] = self._provider_call_id
         entry = {
             **self._turn, "index": self._provider_index, "call_id": self._provider_call_id,
             "request": {
@@ -302,6 +343,29 @@ class _Recorder:
         handle.flush()
         if self._errors:
             raise DiagnosticCaptureError("LLM diagnostic capture incomplete; see capture_errors in the local file")
+
+
+@contextmanager
+def collect_agent_observations(listener: Observer):
+    """Collect test events in memory alongside any active private recorder."""
+    sink = observer.get()
+    recorder = getattr(sink, "__self__", None)
+    if isinstance(recorder, _Recorder) and sink is recorder.sink:
+        # The HTTP capture checks this sink's identity. Register beside it.
+        target = _agent_observation_listener
+        token = target.set(listener)
+    else:
+        def forward(event, **values):
+            if sink is not None:
+                sink(event, **values)
+            listener(event, **values)
+
+        target = observer
+        token = target.set(forward)
+    try:
+        yield
+    finally:
+        target.reset(token)
 
 
 @contextmanager

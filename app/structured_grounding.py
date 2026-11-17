@@ -16,7 +16,7 @@ from decimal import Decimal
 from enum import Enum
 
 from app.month_scope import MonthScope
-from app.observations import observe
+from app.observations import observe, observer
 
 
 _SLOT_NAME = r"[A-Za-z_][A-Za-z_0-9]*"
@@ -393,15 +393,13 @@ def _repair_candidate(
     return field, value
 
 
-def validate_and_render(
-    answer_json: str,
+def _validated_parts(
+    answer: dict[str, object],
     *,
     context: GroundingContext,
     tool_results: Iterable[RecordedToolResult] = (),
     check_reference_repair: bool = False,
-) -> str:
-    """Replace validated slots in the original template using a single pass."""
-    answer = _json_object(answer_json, "invalid_template")
+) -> list[str]:
     template, slots = answer.get("template"), answer.get("slots")
     observe("grounding_parsed", template=template, slots=slots)
     if (answer.keys() != {"template", "slots"} or not isinstance(template, str)
@@ -446,7 +444,64 @@ def validate_and_render(
     parts[1::2] = [values[name] for name in parts[1::2]]
     if sum(map(len, parts)) > _MAX_JSON_LENGTH:
         raise StructuredGroundingError("invalid_template")
-    rendered = "".join(parts)
-    if _SURROGATE.search(rendered):
+    if any(_SURROGATE.search(part) for part in parts):
         raise StructuredGroundingError("invalid_template")
-    return rendered
+    return parts
+
+
+def validate_and_render(
+    answer_json: str,
+    *,
+    context: GroundingContext,
+    tool_results: Iterable[RecordedToolResult] = (),
+    check_reference_repair: bool = False,
+) -> str:
+    """Replace validated slots in the original template using a single pass."""
+    answer = _json_object(answer_json, "invalid_template")
+    return "".join(_validated_parts(answer, context=context, tool_results=tool_results,
+                                    check_reference_repair=check_reference_repair))
+
+
+def _plain_prose_or_whitespace(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return True
+    if text in {"null", "true", "false", "NaN", "Infinity", "-Infinity"}:
+        return False
+    return any(char.isalpha() for char in text) and all(
+        char.isalnum() or char.isspace() or unicodedata.category(char).startswith("M")
+        or char in ".,:;!?،؛؟…()/\u200c\u200d-–—_٪٬٫"
+        for char in text
+    )
+
+
+def is_repairable_json_framing(
+    raw: str, *, context: GroundingContext, tool_results: Iterable[RecordedToolResult],
+) -> bool:
+    """Classify one scoped, prose-framed draft without rendering or observing it."""
+    if type(raw) is not str or len(raw) > _MAX_JSON_LENGTH:
+        return False
+    start = raw.find("{")
+    if start < 0:
+        return False
+    prefix = raw[:start]
+    if not _plain_prose_or_whitespace(prefix):
+        return False
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    try:
+        candidate, end = decoder.raw_decode(raw, start)
+    except (ValueError, RecursionError):
+        return False
+    suffix = raw[end:]
+    if not (prefix.strip() or suffix.strip()) or not _plain_prose_or_whitespace(suffix):
+        return False
+
+    # Eligibility checks must never appear as grounding decisions for the rejected draft.
+    token = observer.set(None)
+    try:
+        parts = _validated_parts(candidate, context=context, tool_results=tool_results)
+        return any(_PERSIAN.search(part) for part in parts)
+    except StructuredGroundingError:
+        return False
+    finally:
+        observer.reset(token)

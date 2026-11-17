@@ -77,3 +77,23 @@ Every stage report must include:
 6. Approval required for the next stage.
 
 For a Phase N-A report, explicitly identify the expected failing tests. For a Phase N-B report, distinguish focused-test results from complete-regression results and identify any evidence that was not obtained.
+
+<!-- KAMIDSO_TDD_PACK_EXTENSION_START -->
+## Additional reusable phase and authorization rules
+
+These rules extend the existing workflow; they do not change its approvals or security contract.
+
+1. Read the **local working tree** and its `AGENTS.md` before acting. Repository snapshots or previous phase reports are not proof that the local files are identical.
+2. Parse the user's authorization into: exact phase/stage, approved files, allowed code/test modifications, allowed test nodes, and whether live provider traffic is explicitly authorized. If any authority is absent, **do not infer it**.
+3. For RED: add only the approved new tests, establish genuine expected failures, keep existing regressions green, never patch production, and stop. For GREEN: start only after RED approval, preserve approved tests and existing contracts, make the minimum change, run focused then full authorized offline suites, and stop.
+4. Treat read-only review and a specifically approved controlled live qualification as separate activities. **A GREEN approval never implicitly authorizes billable tests.** Use `$kamidso-live-qualification` for an explicitly approved live test.
+5. Use `$kamidso-test-runner` for deterministic offline commands, negative controls, regression accounting, and Docker verification. Use `$kamidso-evidence-grounding` when the work touches answer validation, provenance, evidence, artifact correlation, or recovery rules.
+6. Report exact test counts from actual execution; label expected RED failures separately from unexpected failures. Never declare a path live-qualified from offline tests. Report whether a provider response was accepted, and whether pytest later failed in the test harness.
+7. Preserve existing model/provider, reasoning settings, token/call budgets, datasets, `.env`, strict grounding, tenant boundaries, and tool sandbox policies unless the **current authorized phase** explicitly requires a change. Do not begin context/reasoning/token/latency optimization until separately authorized.
+8. If a case fails, isolate the **first failing stage**, record evidence, make no out-of-scope repairs or reruns, and stop at the approved review gate.
+9. Actual API limits, exact live-node names, and expected test counts are **phase inputs**. Read effective local configuration; do not encode historical counts as permanent contract values.
+
+### Stage report additions
+
+In addition to the standard report, include exact commands, test environment and isolation, provider traffic count, tool/Docker activity, persisted state, diagnostics/privacy results, explicit unverified claims, and the next approval gate **when applicable to the stage**. Do not treat every section as a requirement to run expensive or irrelevant tests.
+<!-- KAMIDSO_TDD_PACK_EXTENSION_END -->

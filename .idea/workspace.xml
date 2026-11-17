@@ -5,13 +5,12 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="56ef1d20-ecfe-47da-856d-700bf0d86b33" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/data/alpha.db" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/alpha_tickets.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/beta.db" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/beta_tickets.csv" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/schema.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/demo_tokens.json.example" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.agents/skills/kamidso-tdd/SKILL.md" beforeDir="false" afterPath="$PROJECT_DIR$/.agents/skills/kamidso-tdd/SKILL.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/structured_grounding.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/structured_grounding.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/live_tests/llm_diagnostics.py" beforeDir="false" afterPath="$PROJECT_DIR$/live_tests/llm_diagnostics.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/live_tests/test_agent_end_to_end_live.py" beforeDir="false" afterPath="$PROJECT_DIR$/live_tests/test_agent_end_to_end_live.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -74,6 +73,8 @@
       <workItem from="1794578828865" duration="2389000" />
       <workItem from="1794645869964" duration="1214000" />
       <workItem from="1794729861417" duration="5882000" />
+      <workItem from="1794830599578" duration="2116000" />
+      <workItem from="1794902547093" duration="909000" />
     </task>
     <servers />
   </component>

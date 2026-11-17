@@ -4,6 +4,7 @@ These tests make billable OpenRouter calls only with an explicit, separate opt-i
 They exercise the real HTTP adapter through POST /chat, not a scripted LLM.
 """
 
+import ast
 import csv
 import json
 import os
@@ -20,7 +21,10 @@ from fastapi.testclient import TestClient
 from app.agent import EnvChatCompletionsClient
 from app.config import load_llm_config
 from app.main import create_app
-from live_tests.llm_diagnostics import PYTHON_PNG_NODE
+from app.month_scope import requested_month
+from app.sandbox import _valid_png
+from app.structured_grounding import EvidenceScope
+from live_tests.llm_diagnostics import PYTHON_PNG_NODE, collect_agent_observations
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -232,19 +236,143 @@ def assert_python_revenue_slot(final_content, evidence_refs):
     ), "The final revenue slot must cite the verified Python result"
 
 
+def _revenue_reference(accepted_json):
+    slots = json.loads(accepted_json)["slots"]
+    citations = [slot for slot in slots.values() if slot.get("evidence_field") == "revenue"]
+    assert len(citations) == 1, "Expected exactly one revenue citation in the accepted answer"
+    citation, = citations
+    assert (citation.get("type"), citation.get("unit")) == ("numeric", "scalar")
+    ref = citation.get("evidence_ref")
+    assert isinstance(ref, str) and ref.strip(), "Expected an issued Python evidence ID"
+    return ref
+
+
+def _issued_tool_calls(messages):
+    for message in messages:
+        if message["role"] == "assistant":
+            yield from message.get("tool_calls") or []
+
+
+def _verified_python_record(state, scope, ref):
+    records = [record for record in state.evidence if record.call_id == ref]
+    assert len(records) == 1, "Expected exactly one persisted record for the cited evidence ID"
+    record, = records
+    assert record.scope == scope, "The cited evidence must belong to this tenant and conversation"
+    assert record.tool_name == "execute_python" and record.succeeded is True
+    return record
+
+
+def _resolve_accepted_python_evidence_and_png(accepted_json, response, state, scope, month, total):
+    ref = _revenue_reference(accepted_json)
+    record = _verified_python_record(state, scope, ref)
+    assert len(state.turns) == 1, "Expected only the first turn before the restart"
+    turn, = state.turns
+    assert (turn.trace_id, turn.status, turn.answer) == (response["trace_id"], "success", response["answer"])
+
+    issued = [call["function"] for call in _issued_tool_calls(state.messages) if call["id"] == ref]
+    tool_messages = [message for message in state.messages if message["role"] == "tool"]
+    exchanges = [
+        (step, message) for step, message in zip(turn.trace, tool_messages, strict=True)
+        if message["tool_call_id"] == ref
+    ]
+    assert len(issued) == len(exchanges) == 1, "Expected one original tool exchange for the cited ID"
+    function, = issued
+    (step, message), = exchanges
+    assert function["name"] == step.tool_name == "execute_python" and step.status == "success"
+    result = json.loads(message["content"])
+    assert result == record.result, "Persisted evidence must match the original tool result"
+    assert type(result.get("exit_code")) is int and result["exit_code"] == 0 and result["stderr"] == ""
+    assert matches_python_revenue(result["stdout"], total), "Expected Python revenue to match read-only SQLite"
+
+    code = json.loads(function["arguments"])["code"]
+    literals = {
+        node.value for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    # Docker provides the tenant-scoped export. These source checks corroborate
+    # the input and period alongside the independent revenue comparison.
+    assert "/data/paid_orders.csv" in literals or {"/data", "paid_orders.csv"} <= literals
+    assert month.gregorian_month in literals or (
+        month.first in literals and bool({month.last, month.next_first} & literals)
+    ), "Expected the cited Python code to specify the requested Gregorian month"
+
+    pngs = [item for item in result["artifacts"] if (item["kind"], item["media_type"]) == ("image", "image/png")]
+    assert len(pngs) == 1, "Expected one unambiguous PNG from the cited execution"
+    png, = pngs
+    artifact_id = png["artifact_id"]
+    assert [item for item in response["artifacts"] if item["artifact_id"] == artifact_id] == [png]
+    assert [item.model_dump() for item in state.artifacts if item.artifact_id == artifact_id] == [png]
+    return record, png
+
+
+def _download_verified_png(client, path):
+    owner = client.get(path, headers={"X-Demo-Token": "demo-alpha"})
+    assert owner.status_code == 200 and owner.headers["content-type"] == "image/png"
+    assert _valid_png(owner.content), "Expected a valid PNG from the verified artifact"
+    assert client.get(path, headers={"X-Demo-Token": "demo-beta"}).status_code == 404
+    return owner.content
+
+
+class _PythonPngLiveClient(CountingLiveClient):
+    def __init__(self):
+        super().__init__()
+        self.evidence_manifests = []
+        self.provider_calls_allowed = True
+
+    def create(self, *, messages, tools):
+        assert self.provider_calls_allowed, "Authorization probe must not contact the provider"
+        manifest, = [
+            line.removeprefix("KAMIDSO_EVIDENCE_V1 ") for line in messages[0]["content"].splitlines()
+            if line.startswith("KAMIDSO_EVIDENCE_V1 ")
+        ]
+        self.evidence_manifests.append(json.loads(manifest))
+        return super().create(messages=messages, tools=tools)
+
+
+class _AcceptedFinal:
+    """Match a successful chat response to the raw content grounded on that turn."""
+
+    def __init__(self):
+        self._events = []
+
+    def __call__(self, event, **values):
+        if event in ("turn", "provider_start", "grounding_start", "grounding_end"):
+            self._events.append((event, values))
+
+    def for_response(self, response):
+        trace_id = response["trace_id"]
+        expected = f"Expected exactly one accepted grounding attempt for trace {trace_id}"
+        turns = [values for event, values in self._events if event == "turn"]
+        assert len(turns) == 1 and self._events[0][0] == "turn", expected
+        turn = turns[0]
+        assert turn.get("trace_id") == trace_id and turn.get("conversation_id") == response["conversation_id"], expected
+
+        starts = [i for i, (event, _) in enumerate(self._events) if event == "provider_start"]
+        assert starts and starts[0] == 1, expected
+        indices = [self._events[start][1].get("index") for start in starts]
+        assert all(type(index) is int and index > 0 for index in indices), expected
+        assert indices == sorted(set(indices)), expected
+
+        accepted = []
+        for start, end in zip(starts, [*starts[1:], len(self._events)], strict=True):
+            grounding = self._events[start + 1:end]
+            if not grounding:
+                continue
+            assert [event for event, _ in grounding] == ["grounding_start", "grounding_end"], expected
+            (_, draft), (_, outcome) = grounding
+            if outcome["rejection_reason"] is None:
+                accepted.append((draft["raw_final_content"], outcome["rendered_answer"]))
+
+        assert len(accepted) == 1, expected
+        raw, rendered = accepted[0]
+        assert isinstance(raw, str) and raw, expected
+        assert isinstance(rendered, str) and rendered == response["answer"], expected
+        return raw
+
+
 def test_live_python_png_and_conversation_reuse(tmp_path):
     docker_ready()
-    final_contents = []
-
-    class PythonRevenueClient(CountingLiveClient):
-        def create(self, *, messages, tools):
-            completion = super().create(messages=messages, tools=tools)
-            choice = completion["choices"][0]
-            if choice["finish_reason"] == "stop":
-                final_contents.append(choice["message"].get("content"))
-            return completion
-
-    llm = PythonRevenueClient()
+    llm = _PythonPngLiveClient()
     service = configured_app(tmp_path, llm)
     total = paid_september_total("alpha.db")
     question = (
@@ -261,7 +389,8 @@ def test_live_python_png_and_conversation_reuse(tmp_path):
         "با یک slot عددی با واحد scalar گزارش کن و برای فیلد revenue به شناسهٔ "
         "واقعی شاهد execute_python ارجاع بده."
     )
-    with TestClient(service) as client:
+    first_final = _AcceptedFinal()
+    with collect_agent_observations(first_final), TestClient(service) as client:
         response = client.post(
             "/chat", json={"question": question},
             headers={"X-Demo-Token": "demo-alpha"},
@@ -270,58 +399,73 @@ def test_live_python_png_and_conversation_reuse(tmp_path):
     first = response.json()
     assert_success_trace(first, {"execute_python"})
     assert_persian_amount(first["answer"], total)
-    assert len(first["artifacts"]) >= 1
-    artifact_id = first["artifacts"][0]["artifact_id"]
+    first_raw = first_final.for_response(first)
+    tenant = service.state.secure_data.authenticate("demo-alpha")
+    assert tenant.display_label == "Alpha"
+    scope = EvidenceScope(tenant.state_key, first["conversation_id"])
+    month = requested_month(question)
+    assert month is not None and month.gregorian_month == "2026-09"
     first_state = snapshot(service, "demo-alpha", first["conversation_id"])
-    python_results = [
-        result for name, args, result in tool_exchanges(first_state.messages)
-        if name == "execute_python" and "paid_orders.csv" in args["code"]
-        and result["exit_code"] == 0 and matches_python_revenue(result["stdout"], total)
-        and any(item["artifact_id"] == artifact_id for item in result["artifacts"])
-    ]
-    assert python_results, "Expected the retrieved PNG and correct structured revenue from Python"
-    evidence_refs = {
-        record.call_id for record in first_state.evidence
-        if record.tool_name == "execute_python" and record.succeeded and record.result in python_results
-    }
-    assert evidence_refs, "Expected persisted evidence for the successful Python execution"
-    first_final, = final_contents
-    assert_python_revenue_slot(first_final, evidence_refs)
+    record, png = _resolve_accepted_python_evidence_and_png(first_raw, first, first_state, scope, month, total)
+    evidence_refs = {record.call_id}
+    assert_python_revenue_slot(first_raw, evidence_refs)
+    path = f"/artifacts/{png['artifact_id']}"
     with TestClient(service) as client:
-        image = client.get(
-            f"/artifacts/{artifact_id}", headers={"X-Demo-Token": "demo-alpha"},
-        )
-        foreign = client.get(
-            f"/artifacts/{artifact_id}", headers={"X-Demo-Token": "demo-beta"},
-        )
-    assert image.status_code == 200
-    assert image.headers["content-type"] == "image/png"
-    assert image.content.startswith(b"\x89PNG\r\n\x1a\n")
-    assert foreign.status_code == 404
+        image_bytes = _download_verified_png(client, path)
 
     restarted = configured_app(tmp_path, llm)
-    with TestClient(restarted) as client:
+    followup_offset = len(llm.evidence_manifests)
+    followup_body = {
+        "question": (
+            "عدد دقیق گزارش قبلی را با رقم دوباره بگو و نمودار قبلی را نگه دار. "
+            "برای slot عددی از همان شاهد execute_python و فیلد revenue استفاده کن."
+        ),
+        "conversation_id": first["conversation_id"],
+    }
+    followup_final = _AcceptedFinal()
+    with collect_agent_observations(followup_final), TestClient(restarted) as client:
         followup = client.post(
-            "/chat", json={
-                "question": (
-                    "عدد دقیق گزارش قبلی را با رقم دوباره بگو و نمودار قبلی را نگه دار. "
-                    "برای slot عددی از همان شاهد execute_python و فیلد revenue استفاده کن."
-                ),
-                "conversation_id": first["conversation_id"],
-            }, headers={"X-Demo-Token": "demo-alpha"},
+            "/chat", json=followup_body, headers={"X-Demo-Token": "demo-alpha"},
         )
     assert followup.status_code == 200, followup.status_code
     second = followup.json()
     assert second["conversation_id"] == first["conversation_id"]
     assert second["trace_id"] != first["trace_id"]
     assert_persian_amount(second["answer"], total)
-    _, followup_final = final_contents
-    assert_python_revenue_slot(followup_final, evidence_refs)
-    assert artifact_id in {item["artifact_id"] for item in second["artifacts"]}
-    turns = snapshot(restarted, "demo-alpha", first["conversation_id"]).turns
+    second_raw = followup_final.for_response(second)
+    assert_python_revenue_slot(second_raw, evidence_refs)
+    assert _revenue_reference(second_raw) == record.call_id
+    assert png in second["artifacts"]
+    assert restarted.state.secure_data.authenticate("demo-alpha").state_key == scope.tenant_key
+    second_state = snapshot(restarted, "demo-alpha", first["conversation_id"])
+    turns = second_state.turns
     assert [turn.trace_id for turn in turns] == [first["trace_id"], second["trace_id"]]
     assert [turn.status for turn in turns] == ["success", "success"]
     assert turns[0].trace
+    assert _verified_python_record(second_state, scope, record.call_id) == record
+    assert second_state.messages[:len(first_state.messages)] == first_state.messages
+    followup_messages = second_state.messages[len(first_state.messages):]
+    assert all(step.tool_name != "execute_python" for step in turns[1].trace), "Follow-up executed Python"
+    assert all(
+        call["function"]["name"] != "execute_python" for call in _issued_tool_calls(followup_messages)
+    ), "Follow-up attempted a Python tool call"
+
+    manifest = llm.evidence_manifests[followup_offset]
+    assert manifest["context"]["user_request"] == {
+        "period": month.gregorian_month, "period_start": month.first, "period_end": month.last,
+    }
+    advertised = [tool for tool in manifest["tools"] if tool["evidence_ref"] == record.call_id]
+    assert len(advertised) == 1 and advertised[0]["tool_name"] == "execute_python"
+    assert {"evidence_field": "revenue", "type": "numeric", "unit": "scalar"} in advertised[0]["fields"]
+
+    llm.provider_calls_allowed = False
+    with TestClient(restarted) as client:
+        assert _download_verified_png(client, path) == image_bytes
+        request = client.build_request(
+            "POST", "/chat", json=followup_body, headers={"X-Demo-Token": "demo-beta"},
+        )
+        denied = client.send(request)
+    assert denied.status_code == 404 and denied.json() == {"detail": "Conversation not found"}
 
 
 def test_live_provider_call_budget_stops_after_one_tool_turn(tmp_path, monkeypatch):

@@ -18,7 +18,7 @@ from app.schemas import ArtifactMetadata, ChatRequest, ChatResponse, ToolTrace
 from app.sql_evidence import sql_provenance
 from app.structured_grounding import (
     EvidenceScope, GroundingContext, RecordedToolResult,
-    StructuredGroundingError, UnknownEvidenceReference, validate_and_render,
+    StructuredGroundingError, UnknownEvidenceReference, is_repairable_json_framing, validate_and_render,
 )
 
 
@@ -42,10 +42,42 @@ _SYSTEM = (
     "object when needed. The backend renders your exact template from verified values."
 )
 
+_TEMPLATE_RULES = (
+    'KAMIDSO_TEMPLATE_RULES_V1 Return exactly one JSON object with "template" and "slots", without a code fence. '
+    "Use no literal numeric characters from any Unicode script in template text outside placeholders. "
+    "This includes years, dates, amounts, counts, percentages, and numeric identifiers. "
+    "Every numeric value in the rendered answer must come from a verified slot. "
+    "Use placeholders such as {{user_period}}, {{period_start}}, {{period_end}}, and {{revenue}}. "
+    "Each placeholder requires exactly one grounded slot with the matching name. "
+    "Digits are allowed in otherwise valid placeholder names. Avoid malformed placeholders and unsupported braces. "
+    "Even dates supplied for SQL or Python filtering must go through slots when mentioned in the final answer. "
+    "Use trusted user_request context for reporting periods and verified tool evidence for calculated values. "
+    "Never invent slot values or evidence references. Omit unsupported claims."
+)
+
+_CITATION_RULES = (
+    "KAMIDSO_CITATION_RULES_V1 evidence_ref is an opaque server-issued ID. "
+    "Copy the complete evidence_ref verbatim from KAMIDSO_EVIDENCE_V1.tools, preserving every character, "
+    "including case, digits, underscores, and hyphens. Use evidence_field, type, unit, and row if listed "
+    "from the same field of the same verified record. Never emit <actual_tool_call_id>, copy an example ID, "
+    "or invent an alias. Do not derive an ID from a tool name, call order, or chat history. "
+    "If evidence is unavailable, leave out the unsupported claim."
+)
+
 _ANSWER_REPAIR = (
     "Regenerate the final answer as a fresh JSON object with exactly template and slots. "
     "Use only exact evidence_ref values already advertised in KAMIDSO_EVIDENCE_V1.tools "
     "and their verified fields. Return the final JSON in content without calling any tools."
+)
+
+_FORMAT_REPAIR = (
+    "Generate a fresh final answer as exactly one complete JSON object with template and slots. "
+    "Put no prose before or after the object. Do not call any tools."
+)
+
+_LENGTH_RECOVERY = (
+    "Start fresh after the incomplete completion. If a tool is needed, emit a complete valid tool call. "
+    "Otherwise return one complete structured JSON answer in content."
 )
 
 
@@ -105,6 +137,39 @@ class EnvChatCompletionsClient:
         if not isinstance(completion, dict) or not isinstance(completion.get("choices"), list):
             raise RuntimeError("Invalid LLM provider response")
         return completion
+
+
+def _empty_length_message(message: object) -> bool:
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and "content" in message
+        and message["content"] in (None, "")
+        and message.get("tool_calls") in (None, [])
+        and message.get("function_call") is None
+        and message.get("refusal") in (None, "")
+    )
+
+
+def _valid_recovery_message(finish_reason: object, message: object) -> bool:
+    if (not isinstance(message, dict) or message.get("role") != "assistant"
+            or message.get("function_call") is not None):
+        return False
+    calls = message.get("tool_calls")
+    if finish_reason == "stop":
+        return isinstance(message.get("content"), str) and calls in (None, [])
+    if finish_reason != "tool_calls" or not isinstance(calls, list) or not calls:
+        return False
+    # Check the complete envelope before any recovered tool call reaches dispatch.
+    for call in calls:
+        if not isinstance(call, dict) or call.get("type") != "function":
+            return False
+        call_id, function = call.get("id"), call.get("function")
+        if not isinstance(call_id, str) or not call_id.strip() or not isinstance(function, dict):
+            return False
+        if not isinstance(function.get("name"), str) or not isinstance(function.get("arguments"), str):
+            return False
+    return True
 
 
 def _arguments(name: str, raw: str) -> dict[str, Any]:
@@ -244,6 +309,9 @@ class AgentLoop:
         invalid_month_scope = False
         grounding_started = False
         repair_error: UngroundedAnswerError | None = None
+        repair_event = "repair"
+        length_recovery_attempted = False
+        recovering_length = False
         try:
             while True:
                 if self._max_llm_calls is not None and llm_calls >= self._max_llm_calls:
@@ -257,20 +325,33 @@ class AgentLoop:
                 ] + [record for record in evidence if record.call_id not in prior_ids]
                 manifest = evidence_block(context, eligible)
                 system = messages[0]["content"] + "\n" + manifest
+                recovery_suffix = ""
                 if repair_error is not None:
-                    system += "\n" + _ANSWER_REPAIR
-                outbound = [{"role": "system", "content": system}, *messages[1:]]
+                    instruction = _FORMAT_REPAIR if repair_event == "format_repair" else _ANSWER_REPAIR
+                    recovery_suffix = "\n" + instruction
+                elif recovering_length:
+                    recovery_suffix = "\n" + _LENGTH_RECOVERY
+                outbound = [
+                    {"role": "system", "content": (
+                        system + "\n" + _TEMPLATE_RULES + "\n" + _CITATION_RULES + recovery_suffix
+                    )},
+                    *messages[1:],
+                ]
                 try:
                     llm_calls += 1
-                    observe("provider_start", index=llm_calls)
+                    observe("provider_start", index=llm_calls, length_recovery=recovering_length,
+                            format_repair=repair_event == "format_repair")
                     completion = self._llm.create(messages=outbound, tools=[] if repair_error is not None else self._tools)
                     choice = completion["choices"][0]
-                    message = choice["message"]
+                    finish_reason = choice.get("finish_reason")
+                    message = choice.get("message") if finish_reason == "length" or recovering_length else choice["message"]
                     llm_failures = 0
                 except Exception:
                     if repair_error is not None:
-                        observe("repair", provider_outcome="provider_error")
+                        observe(repair_event, provider_outcome="provider_error")
                         raise repair_error from None
+                    if recovering_length:
+                        raise AgentOperationFailed("LLM length recovery failed", trace) from None
                     llm_failures += 1
                     if llm_failures > 2:
                         raise AgentOperationFailed("LLM operation failed", trace) from None
@@ -278,20 +359,44 @@ class AgentLoop:
                 finally:
                     observe("provider_end")
 
+                usage = completion.get("usage")
+                amount = usage.get("total_tokens") if isinstance(usage, dict) else None
+                reported_tokens = amount if type(amount) is int and amount >= 0 else None
+                if reported_tokens is not None:
+                    used_tokens += reported_tokens
+                budget_error = None
                 if self._max_total_tokens is not None:
-                    usage = completion.get("usage")
-                    amount = usage.get("total_tokens") if isinstance(usage, dict) else None
-                    if type(amount) is not int or amount < 0:
-                        raise ProviderBudgetExceeded("LLM usage unavailable", trace)
-                    used_tokens += amount
-                    if used_tokens >= self._max_total_tokens:
-                        raise ProviderBudgetExceeded("LLM token budget exceeded", trace)
+                    if reported_tokens is None:
+                        budget_error = "LLM usage unavailable"
+                    elif used_tokens >= self._max_total_tokens:
+                        budget_error = "LLM token budget exceeded"
+                if finish_reason == "length" and repair_error is None and not length_recovery_attempted:
+                    may_recover = (
+                        _empty_length_message(message) and reported_tokens is not None and budget_error is None
+                        and (self._max_llm_calls is None or llm_calls < self._max_llm_calls)
+                    )
+                    observe("length_completion", eligible=may_recover, original_finish_reason=finish_reason,
+                            original_reported_tokens=reported_tokens)
+                    if may_recover:
+                        length_recovery_attempted = recovering_length = True
+                        continue
+                if recovering_length:
+                    observe("length_recovery_response", recovery_finish_reason=finish_reason,
+                            recovery_reported_tokens=reported_tokens)
+                if budget_error is not None:
+                    raise ProviderBudgetExceeded(budget_error, trace)
+                if recovering_length:
+                    if not _valid_recovery_message(finish_reason, message):
+                        raise AgentOperationFailed("Invalid LLM length recovery response", trace)
+                    recovering_length = False
 
-                if repair_error is not None and (choice.get("finish_reason") != "stop"
-                                                 or not isinstance(message, dict) or message.get("tool_calls")):
-                    observe("repair", provider_outcome="invalid_final_response")
+                if repair_error is not None and (
+                    finish_reason != "stop" or not isinstance(message, dict) or message.get("tool_calls")
+                    or (repair_event == "format_repair" and not _valid_recovery_message(finish_reason, message))
+                ):
+                    observe(repair_event, provider_outcome="invalid_final_response")
                     raise repair_error from None
-                if choice["finish_reason"] == "stop":
+                if finish_reason == "stop":
                     answer = message.get("content")
                     grounding_started = True
                     observe("grounding_start", raw_final_content=answer, is_repair=repair_error is not None)
@@ -313,14 +418,29 @@ class AgentLoop:
                         if repair_error is not None:
                             raise repair_error from None
                         rejected = UngroundedAnswerError(exc.reason_code, trace)
+                        if exc.reason_code == "invalid_template":
+                            eligible_format = _valid_recovery_message(finish_reason, message) and is_repairable_json_framing(
+                                answer, context=context, tool_results=eligible,
+                            )
+                            attempted = eligible_format and (
+                                self._max_llm_calls is None or llm_calls < self._max_llm_calls
+                            )
+                            observe("format_repair", eligible=attempted, attempted=attempted,
+                                    blocked_by_call_limit=eligible_format and not attempted)
+                            if attempted:
+                                repair_error = rejected
+                                repair_event = "format_repair"
+                                continue
                         if isinstance(exc, UnknownEvidenceReference):
                             reference = json.dumps(exc.reference, ensure_ascii=False)[1:-1]
+                            # Preserve the repair gate's prior input by omitting the static guidance.
+                            repair_context = [{"role": "system", "content": system + recovery_suffix}, *outbound[1:]]
                             eligible_for_repair = (
                                 exc.candidate is not None and exc.reference not in prior_ids
                                 and exc.reference not in current_ids
                                 and advertises_address(manifest, exc.candidate)
                                 and reference not in _ANSWER_REPAIR
-                                and reference not in json.dumps(outbound, ensure_ascii=False)
+                                and reference not in json.dumps(repair_context, ensure_ascii=False)
                                 and (self._state_store is None
                                      or self._state_store.reference_is_unissued(exc.reference))
                             )
@@ -342,11 +462,12 @@ class AgentLoop:
                             status="success", answer=answer, trace=trace,
                             messages=messages[turn_start:], artifacts=new_artifacts, evidence=evidence,
                         )
+                    observe("turn_end", outcome="success", provider_calls=llm_calls, cumulative_tokens=used_tokens)
                     return ChatResponse(
                         conversation_id=conversation_id, trace_id=trace_id,
                         answer=answer, artifacts=artifacts, trace=trace,
                     )
-                if choice["finish_reason"] != "tool_calls" or not message.get("tool_calls"):
+                if finish_reason != "tool_calls" or not message.get("tool_calls"):
                     raise AgentOperationFailed("Invalid LLM response", trace)
 
                 messages.append({**message, "role": "assistant"})
@@ -405,7 +526,7 @@ class AgentLoop:
                         raise AgentOperationFailed("Tool operation failed after retries", trace)
         except AgentLoopError as exc:
             if repair_error is not None and isinstance(exc, ProviderBudgetExceeded):
-                observe("repair", provider_outcome="budget_exceeded")
+                observe(repair_event, provider_outcome="budget_exceeded")
             if grounding_started:
                 observe("grounding_end", rendered_answer=None,
                         rejection_reason=(exc.reason_code if isinstance(exc, UngroundedAnswerError)
@@ -418,4 +539,5 @@ class AgentLoop:
                     failure_code=(exc.reason_code if isinstance(exc, UngroundedAnswerError)
                                   else None),
                 )
+            observe("turn_end", outcome="failed", provider_calls=llm_calls, cumulative_tokens=used_tokens)
             raise
