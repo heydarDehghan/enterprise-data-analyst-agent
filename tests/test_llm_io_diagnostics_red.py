@@ -200,7 +200,16 @@ def test_exact_provider_bodies_and_correlated_grounding_leave_execution_unchange
     assert recorded_tools == baseline_tools and len(recorded_tools) == 2
     assert state.messages == baseline_state.messages
     assert result.json()["answer"] == baseline.json()["answer"]
-    assert result.json()["trace"] == baseline.json()["trace"]
+
+    def semantic_trace(response):
+        trace = response.json()["trace"]
+        assert len(trace) == len(recorded_tools)
+        for step in trace:
+            duration_ms = step.pop("duration_ms")
+            assert type(duration_ms) is int and duration_ms >= 0
+        return trace
+
+    assert semantic_trace(result) == semantic_trace(baseline)
 
     data = read_capture(path)
     first, second = calls = data["provider_calls"]

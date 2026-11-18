@@ -4,8 +4,11 @@ import json
 import re
 from collections.abc import Iterable
 
+from app.agent_tools import PURCHASE_DROPS_TOOL_NAME
+from app.month_scope import ComparisonScope
 from app.structured_grounding import (
     EvidenceAddress, GroundingContext, RecordedToolResult, citable_fields, evidence_registry,
+    purchase_drop_matches_period,
 )
 
 
@@ -46,11 +49,12 @@ def _context_fields(context: GroundingContext) -> dict[str, dict[str, str]]:
     fields: dict[str, dict[str, str]] = {}
     if context.tenant_label and _TENANT_LABEL.fullmatch(context.tenant_label):
         fields["tenant_context"] = {"value": context.tenant_label}
-    if context.month is not None:
-        month = context.month
-        fields["user_request"] = {"period_start": month.first, "period_end": month.last}
-        if month.gregorian_month is not None:
-            fields["user_request"]["period"] = month.gregorian_month
+    period = context.reporting_scope
+    if period is not None:
+        fields["user_request"] = {"period_start": period.first, "period_end": period.last}
+        label = period.label if isinstance(period, ComparisonScope) else period.gregorian_month
+        if label is not None:
+            fields["user_request"]["period"] = label
     return fields
 
 
@@ -64,17 +68,38 @@ def evidence_block(context: GroundingContext, records: Iterable[RecordedToolResu
     periods: dict[str, dict[str, str]] = {}
     manifest = {"context": _context_fields(context), "tools": tools,
                 "verified_periods": periods, "truncated": False}
+    eligible = [
+        record for record in reversed(evidence_registry(context.scope, records).values())
+        if record is not None and _TOOL_ID.fullmatch(record.call_id) and record.call_id not in _CONTEXT_SOURCES
+    ]
+    period = context.reporting_scope
+    ranking = next((record for record in eligible
+                    if record.succeeded and record.purchase_drop is not None and record.result.get("rows")
+                    and (record.purchase_drop == period or (
+                        record.tool_name == PURCHASE_DROPS_TOOL_NAME
+                        and purchase_drop_matches_period(record.purchase_drop, period)
+                    ))), None)
+    if ranking is not None:
+        eligible.sort(key=lambda record: (record is not ranking, record.tool_name != "get_tickets"))
+
     field_count = 0
-    for record in reversed(evidence_registry(context.scope, records).values()):
-        if record is None or not _TOOL_ID.fullmatch(record.call_id) or record.call_id in _CONTEXT_SOURCES:
-            continue
+    for record in eligible:
+        field_limit = _MAX_FIELDS_PER_TOOL
+        if record is ranking:
+            field_limit = ranking.purchase_drop.limit * len(ranking.sql_fields)
         fields: list[dict[str, object]] = []
-        for name, row, kind, value in citable_fields(record, context.month):
+        for name, row, kind, value in citable_fields(record, context):
             # Names and IDs can originate in model-generated SQL or Python.
             # Only short opaque identifiers enter the system message.
             if not _FIELD_NAME.fullmatch(name):
                 continue
-            if field_count == _MAX_FIELDS or len(fields) == _MAX_FIELDS_PER_TOOL:
+            if ranking is not None and record.tool_name == "get_tickets" and not (
+                name == "ticket_id" or (name == "ticket_count" and value == 0)
+            ):
+                # Keep the ranking, ticket IDs and explicit empty results within the shared cap.
+                manifest["truncated"] = True
+                continue
+            if field_count == _MAX_FIELDS or len(fields) == field_limit:
                 manifest["truncated"] = True
                 break
             if not fields:

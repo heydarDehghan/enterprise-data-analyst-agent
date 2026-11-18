@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Any
@@ -9,17 +10,25 @@ from uuid import uuid4
 
 import httpx
 
-from app.agent_tools import PYTHON_TOOL, TOOLS
+from app.agent_tools import PURCHASE_DROPS_TOOL, PURCHASE_DROPS_TOOL_NAME, PYTHON_TOOL, TOOLS
 from app.config import load_llm_config
 from app.evidence_presentation import SLOT_EXAMPLES, advertises_address, evidence_block
-from app.month_scope import needs_month_scope, references_previous_report, requested_month, sql_matches_month
+from app.month_scope import (
+    PurchaseDropScope, needs_month_scope, references_previous_report, requested_comparison, requested_month,
+    sql_matches_month,
+)
 from app.observations import observe
 from app.schemas import ArtifactMetadata, ChatRequest, ChatResponse, ToolTrace
-from app.sql_evidence import sql_provenance
+from app.secure_data import TenantContext, purchase_drop_scope
+from app.sql_evidence import purchase_drop_fields, sql_provenance
 from app.structured_grounding import (
-    EvidenceScope, GroundingContext, RecordedToolResult,
-    StructuredGroundingError, UnknownEvidenceReference, is_repairable_json_framing, validate_and_render,
+    PURCHASE_DROP_FIELDS, EvidenceScope, GroundingContext, RecordedToolResult,
+    StructuredGroundingError, UnknownEvidenceReference, _unique_object, is_repairable_json_framing,
+    purchase_drop_matches_period, validate_and_render,
 )
+
+
+_CUSTOMER_ID = re.compile(r"(?<![\w-])[A-Z][0-9]{3}(?![\w-])")
 
 
 _SYSTEM = (
@@ -174,7 +183,7 @@ def _valid_recovery_message(finish_reason: object, message: object) -> bool:
 
 def _arguments(name: str, raw: str) -> dict[str, Any]:
     try:
-        args = json.loads(raw)
+        args = json.loads(raw, object_pairs_hook=_unique_object if name == PURCHASE_DROPS_TOOL_NAME else None)
     except (TypeError, ValueError) as exc:
         raise ValueError("Invalid tool arguments") from exc
     if not isinstance(args, dict):
@@ -194,6 +203,8 @@ def _arguments(name: str, raw: str) -> dict[str, Any]:
     if name == "execute_python" and set(args) == {"code"} and (
         isinstance(args["code"], str) and args["code"].strip()
     ):
+        return args
+    if name == PURCHASE_DROPS_TOOL_NAME and set(args) == {"baseline_month", "comparison_month", "limit"}:
         return args
     raise ValueError("Unknown tool or invalid tool arguments")
 
@@ -219,6 +230,7 @@ class AgentLoop:
         trace_id_factory: Callable[[], str] | None = None,
         max_llm_calls: int | None = None,
         max_total_tokens: int | None = None,
+        purchase_drops_enabled: bool = False,
     ) -> None:
         self._llm = llm
         self._tenant = tenant
@@ -226,6 +238,9 @@ class AgentLoop:
         self._sandbox = sandbox
         self._state_store = state_store
         self._tools = [*TOOLS, PYTHON_TOOL] if sandbox is not None else TOOLS
+        self._purchase_drops_enabled = purchase_drops_enabled
+        if purchase_drops_enabled:
+            self._tools = [*self._tools, PURCHASE_DROPS_TOOL]
         self._trace_id_factory = trace_id_factory or (lambda: uuid4().hex)
         if max_llm_calls is not None and max_llm_calls < 1:
             raise ValueError("LLM call limit must be positive")
@@ -237,6 +252,8 @@ class AgentLoop:
     def _execute(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "query_sql":
             return {"rows": self._tenant.agent_query(args["sql"], args.get("params", []))}
+        if name == PURCHASE_DROPS_TOOL_NAME and self._purchase_drops_enabled:
+            return self._tenant.customer_purchase_drops(**args)
         if name == "get_schema":
             return {"schema": self._schema_text}
         if name == "get_tickets":
@@ -275,10 +292,19 @@ class AgentLoop:
         month_scope = requested_month(request.question)
         if month_scope is None and preceding_question and references_previous_report(request.question):
             month_scope = requested_month(preceding_question)
+        customer_ids = set(_CUSTOMER_ID.findall(request.question))
+        requested_customer_id = None
+        if len(customer_ids) == 1 and isinstance(self._tenant, TenantContext):
+            candidate, = customer_ids
+            if self._tenant.query("SELECT customer_id FROM customers WHERE customer_id = ? LIMIT 1", (candidate,)):
+                requested_customer_id = candidate
         context = GroundingContext(
             EvidenceScope(self._tenant.state_key, conversation_id),
             getattr(self._tenant, "display_label", None),
             month_scope,
+            comparison=requested_comparison(request.question) if month_scope is None else None,
+            requested_customer_id=requested_customer_id,
+            customer_mentioned=bool(customer_ids),
         )
         evidence: list[RecordedToolResult] = []
         # History can reserve IDs, but only the store's attestations can make
@@ -483,21 +509,43 @@ class AgentLoop:
                     raw = tool_call.get("function", {}).get("arguments", "")
                     signature = ("invalid", name if isinstance(name, str) else "unknown")
                     fields, window = {}, None
+                    ranking_fields = {}
+                    typed_purchase_drop = None
+                    ticket_customer_id = None
                     args = None
+                    duration_ms = None
                     try:
                         args = _arguments(name, raw)
+                        if name == PURCHASE_DROPS_TOOL_NAME:
+                            if not self._purchase_drops_enabled:
+                                raise ValueError("Purchase-drop tool is disabled")
+                            typed_purchase_drop = purchase_drop_scope(**args)
+                            if not purchase_drop_matches_period(typed_purchase_drop, context.reporting_scope):
+                                raise ValueError("Purchase-drop months conflict with the request period")
                         signature = _retry_signature(name, args)
-                        result = self._execute(name, args)
+                        started_ns = time.monotonic_ns()
+                        try:
+                            result = self._execute(name, args)
+                        finally:
+                            duration_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
                         status, error = "success", None
                         if name == "query_sql":
                             sql, params = args["sql"], args.get("params", [])
                             fields, window = sql_provenance(sql, params, result["rows"])
+                            if not fields and isinstance(context.comparison, PurchaseDropScope):
+                                ranking_fields = purchase_drop_fields(sql, params, result["rows"], context.comparison)
                             if month_scope is not None and needs_month_scope(sql, result["rows"]):
                                 invalid_month_scope = not (
                                     sql_matches_month(sql, params, month_scope)
                                     and (window is None or
                                          (window.first, window.last) == (month_scope.first, month_scope.last))
                                 )
+                        elif name == PURCHASE_DROPS_TOOL_NAME:
+                            ranking_fields = PURCHASE_DROP_FIELDS
+                        elif name == "get_tickets":
+                            customer_filter = args.get("customer_id")
+                            if customer_filter is not None and _CUSTOMER_ID.fullmatch(customer_filter):
+                                ticket_customer_id = customer_filter
                         elif name == "execute_python":
                             added = [ArtifactMetadata.model_validate(item)
                                      for item in result["artifacts"]]
@@ -510,10 +558,13 @@ class AgentLoop:
                         result = {"error": error}
                     evidence.append(RecordedToolResult(
                         context.scope, call_id, name, status == "success", result,
-                        {column: field.kind for column, field in fields.items()}, window, fields,
+                        sql_fields=ranking_fields or {column: field.kind for column, field in fields.items()},
+                        sql_month=window, sql_provenance=fields,
+                        purchase_drop=(typed_purchase_drop or context.comparison) if ranking_fields else None,
+                        ticket_customer_id=ticket_customer_id,
                     ))
                     trace.append(ToolTrace(
-                        step=len(trace) + 1, tool_name=name, status=status, error=error
+                        step=len(trace) + 1, tool_name=name, status=status, duration_ms=duration_ms, error=error,
                     ))
                     result_text = json.dumps(result, ensure_ascii=False)
                     messages.append({

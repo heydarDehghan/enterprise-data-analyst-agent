@@ -8,7 +8,7 @@ import calendar
 import re
 from datetime import date, timedelta
 
-from app.month_scope import MonthScope, _bound_sql
+from app.month_scope import MonthScope, PurchaseDropScope, _bound_sql
 from app.structured_grounding import FieldKind, SqlField
 
 
@@ -103,3 +103,36 @@ def sql_provenance(
         if match["sep"] == "," and position == len(projection):
             return {}, None
     return fields, window
+
+
+def _conditional_revenue(month: str) -> str:
+    return (
+        rf"SUM\s*\(\s*CASE\s+WHEN\s+substr\s*\(\s*order_date\s*,\s*1\s*,\s*7\s*\)\s*=\s*'{month}'"
+        r"\s+THEN\s+amount_toman\s+ELSE\s+0\s+END\s*\)"
+    )
+
+
+def purchase_drop_fields(
+    sql: str, params: list, rows: list[dict], scope: PurchaseDropScope,
+) -> dict[str, FieldKind]:
+    """Qualify only the captured Q2 ranking over the requested ordered months."""
+    (baseline_start, _), (comparison_start, comparison_end) = scope.month_windows
+    baseline = _conditional_revenue(baseline_start[:7])
+    comparison = _conditional_revenue(comparison_start[:7])
+    cutoff = (date.fromisoformat(comparison_end) + timedelta(days=1)).isoformat()
+    pattern = (
+        rf"\s*SELECT\s+customer_id\s*,\s*{baseline}\s+AS\s+sep_revenue\s*,"
+        rf"\s*{comparison}\s+AS\s+oct_revenue\s*,\s*{baseline}\s*-\s*{comparison}\s+AS\s+drop_toman"
+        rf"\s+FROM\s+paid_orders\s+WHERE\s+order_date\s*>=\s*'{baseline_start}'"
+        rf"\s+AND\s+order_date\s*<\s*'{cutoff}'\s+GROUP\s+BY\s+customer_id"
+        rf"\s+HAVING\s+drop_toman\s*>\s*0\s+ORDER\s+BY\s+drop_toman\s+DESC\s+LIMIT\s+{scope.limit}\s*;?\s*"
+    )
+    fields = {
+        "customer_id": FieldKind.IDENTIFIER, "sep_revenue": FieldKind.TOMAN,
+        "oct_revenue": FieldKind.TOMAN, "drop_toman": FieldKind.TOMAN,
+    }
+    if params or not re.fullmatch(pattern, sql, _FLAGS) or not (
+        0 < len(rows) <= scope.limit and all(row.keys() == fields.keys() for row in rows)
+    ):
+        return {}
+    return fields

@@ -171,7 +171,16 @@ def test_beta_capture_preserves_exact_provider_and_grounding_observations(tmp_pa
                                 path=path, replies=replies, enabled=True)
     assert baseline.status_code == result.status_code == 200
     assert result.json()["answer"] == baseline.json()["answer"]
-    assert result.json()["trace"] == baseline.json()["trace"]
+
+    def semantic_trace(response):
+        trace = response.json()["trace"]
+        assert len(trace) == 2
+        for step in trace:
+            duration_ms = step.pop("duration_ms")
+            assert type(duration_ms) is int and duration_ms >= 0
+        return trace
+
+    assert semantic_trace(result) == semantic_trace(baseline)
     assert seen == baseline_seen and len(seen) == 2
     data = load_capture(path, BETA_NODE)
     first, second = data["provider_calls"]

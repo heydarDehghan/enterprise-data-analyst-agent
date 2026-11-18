@@ -2,6 +2,8 @@
 
 from textwrap import dedent
 
+from app.secure_data import MAX_PURCHASE_DROP_ROWS
+
 
 def _tool(name, description, properties, required=()):
     return {
@@ -59,6 +61,20 @@ TOOLS = [
         "customer_id": {"type": "string", "description": "Optional exact customer ID filter."},
     }),
 ]
+
+PURCHASE_DROPS_TOOL_NAME = "get_customer_purchase_drops"
+PURCHASE_DROPS_TOOL = _tool(PURCHASE_DROPS_TOOL_NAME, f"""
+    Rank customers by positive purchase decline from an earlier Gregorian baseline_month to a
+    later comparison_month. Both are YYYY-MM. Provide an integer limit from 1 to {MAX_PURCHASE_DROP_ROWS}.
+    The result includes both month labels and rows with customer_id, baseline_revenue_toman,
+    comparison_revenue_toman and decrease_toman. Revenue uses paid orders only, with zero for
+    missing paid sales. Cite verified row fields from this tool. Use get_tickets separately
+    for related tickets. {_TENANT} {_ERROR}
+    """, {
+    "baseline_month": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])$"},
+    "comparison_month": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])$"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_PURCHASE_DROP_ROWS},
+}, ("baseline_month", "comparison_month", "limit"))
 
 PYTHON_TOOL = _tool("execute_python", f"""
     Use for analysis or PNG generation in an isolated Docker container. Pass a nonblank code string.

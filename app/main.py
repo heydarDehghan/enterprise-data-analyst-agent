@@ -66,6 +66,7 @@ def chat(
         llm=llm, tenant=tenant, schema_text=schema_text,
         sandbox=getattr(state, "sandbox", None), state_store=store,
         max_llm_calls=calls, max_total_tokens=tokens,
+        purchase_drops_enabled=getattr(state, "purchase_drops_enabled", False),
     )
     try:
         return loop.run(body)
@@ -132,6 +133,7 @@ def create_app(
     service.state.schema_text = schema_text
     service.state.sandbox = DockerPythonSandbox(image=docker_image, artifact_root=artifact_root)
     service.state.llm_client = llm_client
+    service.state.purchase_drops_enabled = True
     _register_routes(service)
     return service
 

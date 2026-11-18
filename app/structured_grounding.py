@@ -15,7 +15,8 @@ from datetime import date
 from decimal import Decimal
 from enum import Enum
 
-from app.month_scope import MonthScope
+from app.agent_tools import PURCHASE_DROPS_TOOL_NAME
+from app.month_scope import ComparisonScope, MonthScope, PurchaseDropScope
 from app.observations import observe, observer
 
 
@@ -54,6 +55,13 @@ class GroundingContext:
     scope: EvidenceScope
     tenant_label: str | None = None
     month: MonthScope | None = None
+    comparison: ComparisonScope | None = None
+    requested_customer_id: str | None = None
+    customer_mentioned: bool = False
+
+    @property
+    def reporting_scope(self) -> MonthScope | ComparisonScope | None:
+        return self.comparison or self.month
 
 
 class FieldKind(Enum):
@@ -63,6 +71,14 @@ class FieldKind(Enum):
     SCALAR = ("numeric", "scalar")
     DATE = ("date", None)
     IDENTIFIER = ("identifier", None)
+
+
+PURCHASE_DROP_FIELDS = {
+    "customer_id": FieldKind.IDENTIFIER,
+    "baseline_revenue_toman": FieldKind.TOMAN,
+    "comparison_revenue_toman": FieldKind.TOMAN,
+    "decrease_toman": FieldKind.TOMAN,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +119,9 @@ class RecordedToolResult:
     sql_fields: Mapping[str, FieldKind] = field(default_factory=dict)
     sql_month: MonthScope | None = None
     sql_provenance: Mapping[str, SqlField] = field(default_factory=dict)
+    # Two-month ranking proof is scoped to the current turn. Durable SQL proofs use sql_provenance.
+    purchase_drop: PurchaseDropScope | None = None
+    ticket_customer_id: str | None = None
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -214,19 +233,38 @@ def _python_metrics(result: Mapping[str, object]) -> dict[str, object]:
     raise StructuredGroundingError("unsupported_number")
 
 
+def purchase_drop_matches_period(
+    scope: PurchaseDropScope, period: MonthScope | ComparisonScope | None,
+) -> bool:
+    return period is None or (
+        isinstance(period, ComparisonScope) and scope.month_windows == period.month_windows
+    )
+
+
 def _tool_field(
-    record: RecordedToolResult, name: str, row: int | None, month: MonthScope | None,
+    record: RecordedToolResult, name: str, row: int | None, context: GroundingContext,
 ) -> tuple[FieldKind, object]:
     result = record.result
     if record.succeeded is not True or not isinstance(result, Mapping) or "error" in result:
         raise StructuredGroundingError("unsupported_number")
-    if record.tool_name == "query_sql":
+    if record.tool_name in ("query_sql", PURCHASE_DROPS_TOOL_NAME):
+        period = context.reporting_scope
         kind = record.sql_fields.get(name)
         if not isinstance(kind, FieldKind):
             raise StructuredGroundingError("unsupported_number")
-        if month is not None and (kind.value[0] == "numeric" or record.sql_month is not None):
-            window = record.sql_month
-            if window is None or (window.first, window.last) != (month.first, month.last):
+        window = record.sql_month
+        bounds = (window.first, window.last) if window is not None else None
+        if record.tool_name == PURCHASE_DROPS_TOOL_NAME:
+            if record.purchase_drop is None or not purchase_drop_matches_period(record.purchase_drop, period):
+                raise StructuredGroundingError("invalid_date_range")
+        elif record.purchase_drop is not None:
+            if record.purchase_drop != period:
+                raise StructuredGroundingError("invalid_date_range")
+        elif isinstance(period, ComparisonScope):
+            if kind is FieldKind.TOMAN and bounds not in period.month_windows:
+                raise StructuredGroundingError("invalid_date_range")
+        elif period is not None and (kind.value[0] == "numeric" or window is not None):
+            if bounds != (period.first, period.last):
                 raise StructuredGroundingError("invalid_date_range")
         values = _select_row(result.get("rows"), row)
         if name in values:
@@ -234,6 +272,11 @@ def _tool_field(
     elif record.tool_name == "get_tickets":
         tickets = result.get("tickets")
         if name == "ticket_count" and row is None and isinstance(tickets, list):
+            customer_id = context.requested_customer_id
+            if (context.customer_mentioned or customer_id is not None) and (
+                customer_id is None or record.ticket_customer_id != customer_id
+            ):
+                raise StructuredGroundingError("unsupported_number")
             if all(isinstance(ticket, dict) for ticket in tickets):
                 return FieldKind.COUNT, len(tickets)
         elif name in _TICKET_FIELDS:
@@ -248,7 +291,7 @@ def _tool_field(
 
 
 def _field_candidates(record: RecordedToolResult) -> Iterator[tuple[str, int | None]]:
-    if record.tool_name == "query_sql":
+    if record.tool_name in ("query_sql", PURCHASE_DROPS_TOOL_NAME):
         rows, names = record.result.get("rows"), record.sql_fields
     elif record.tool_name == "get_tickets":
         yield "ticket_count", None
@@ -262,7 +305,7 @@ def _field_candidates(record: RecordedToolResult) -> Iterator[tuple[str, int | N
 
 
 def citable_fields(
-    record: RecordedToolResult, month: MonthScope | None,
+    record: RecordedToolResult, context: GroundingContext,
 ) -> Iterator[tuple[str, int | None, FieldKind, object]]:
     """Expose only addresses the grounding resolver can actually validate."""
     if record.succeeded is not True or not isinstance(record.result, Mapping) or "error" in record.result:
@@ -282,7 +325,7 @@ def citable_fields(
         return
     for name, row in _field_candidates(record):
         try:
-            kind, value = _tool_field(record, name, row, month)
+            kind, value = _tool_field(record, name, row, context)
             if kind.value[0] == "numeric":
                 _numeric_value(value, kind)
             elif kind is FieldKind.DATE:
@@ -311,15 +354,21 @@ def _context_value(slot: dict[str, object], value: str, context: GroundingContex
         observe("authority", authoritative_value=context.tenant_label, type="text", unit=None)
         if context.tenant_label is not None and value == context.tenant_label:
             return context.tenant_label
-    elif slot["source"] == "user_request" and context.month is not None:
-        month = context.month
-        if keys == {"source", "value"} and month.gregorian_month is not None:
-            observe("authority", authoritative_value=month.gregorian_month, type="period", unit=None)
-            if _ascii_digits(value) == month.gregorian_month:
-                return month.gregorian_month
+    elif (
+        slot["source"] == "user_request" and keys == {"source", "value", "type"} and slot["type"] == "identifier"
+    ):
+        observe("authority", authoritative_value=context.requested_customer_id, type="identifier", unit=None)
+        if context.requested_customer_id is not None and value == context.requested_customer_id:
+            return context.requested_customer_id
+    elif slot["source"] == "user_request" and (period := context.reporting_scope) is not None:
+        label = period.label if isinstance(period, ComparisonScope) else period.gregorian_month
+        if keys == {"source", "value"} and label is not None:
+            observe("authority", authoritative_value=label, type="period", unit=None)
+            if _ascii_digits(value) == _ascii_digits(label):
+                return label
         if keys == {"source", "value", "type", "field"} and slot["type"] == "date":
             if slot["field"] in ("period_start", "period_end"):
-                expected = month.first if slot["field"] == "period_start" else month.last
+                expected = period.first if slot["field"] == "period_start" else period.last
                 observe("authority", authoritative_value=expected, type="date", unit=None)
                 if _iso_date(value) == expected:
                     return expected
@@ -348,7 +397,7 @@ def _slot_value(
     if record is None:
         raise StructuredGroundingError("unsupported_number")
 
-    kind, actual = _tool_field(record, name, row, context.month)
+    kind, actual = _tool_field(record, name, row, context)
     observe("authority", authoritative_value=actual, type=kind.value[0], unit=kind.value[1])
     return _validated_field_value(slot, value, kind, actual)
 
@@ -370,7 +419,8 @@ def _validated_field_value(slot: Mapping[str, object], value: str, kind: FieldKi
 
 
 def _repair_candidate(
-    slot: dict[str, object], records: Mapping[str, RecordedToolResult | None], month: MonthScope | None,
+    slot: dict[str, object], records: Mapping[str, RecordedToolResult | None],
+    context: GroundingContext,
 ) -> tuple[EvidenceAddress, str] | None:
     # Determine uniqueness by field address and type before considering the proposed value.
     address = (slot["evidence_field"], slot.get("row"), (slot["type"], slot.get("unit")))
@@ -378,7 +428,7 @@ def _repair_candidate(
     for ref, record in records.items():
         if record is None:
             continue
-        for name, row, kind, actual in citable_fields(record, month):
+        for name, row, kind, actual in citable_fields(record, context):
             if (name, row, kind.value) == address:
                 if candidate is not None:
                     return None
@@ -425,7 +475,7 @@ def _validated_parts(
             if pending is not None:
                 raise pending[0] from None
             if check_reference_repair and isinstance(exc, UnknownEvidenceReference):
-                candidate = _repair_candidate(slot, records, context.month)
+                candidate = _repair_candidate(slot, records, context)
                 if candidate is not None:
                     pending = (exc, name, *candidate)
                     continue

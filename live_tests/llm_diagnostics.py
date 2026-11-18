@@ -15,6 +15,7 @@ import httpx
 
 from app.config import load_llm_config
 from app.observations import Observer, observer
+from app.schemas import ToolTrace
 
 
 ALPHA_NODE = (
@@ -30,6 +31,10 @@ APPROVED_DIAGNOSTIC_NODES = frozenset({ALPHA_NODE, BETA_NODE, PYTHON_PNG_NODE})
 CAPTURE_PATH = "KAMIDSO_LLM_DIAGNOSTICS_PATH"
 _MAX_BYTES = 16 * 1024 * 1024
 _REDACTED = "[REDACTED]"
+_CAPTURE_FIELDS = frozenset({
+    "schema_version", "run_id", "test_node_id", "runtime_limits", "provider_calls",
+    "tool_executions", "grounding", "length_recovery", "capture_errors",
+})
 _agent_observation_listener: ContextVar[Observer | None] = ContextVar(
     "live_test_agent_observation_listener", default=None,
 )
@@ -303,43 +308,48 @@ class _Recorder:
 
         return client_factory
 
-    def _write(self, handle, data):
-        payload = json.dumps(data, ensure_ascii=False, indent=2, default=self._json_value)
-        handle.write(payload.encode("utf-8", errors="backslashreplace") + b"\n")
+    def _encode(self, data):
+        payload = json.dumps(self._redact(data), ensure_ascii=False, indent=2, default=self._json_value)
+        return payload.encode("utf-8", errors="backslashreplace") + b"\n"
 
     def _json_value(self, value):
         if isinstance(value, Decimal):
-            return str(value)
+            return self._redact(str(value))
         raise TypeError("Unsupported diagnostic value")
 
     def _redact(self, value):
+        if isinstance(value, ToolTrace):
+            value = value.model_dump(mode="json")
         if isinstance(value, str):
             return value.replace(self._credential, _REDACTED)
         if isinstance(value, dict):
             return {self._redact(key): self._redact(item) for key, item in value.items()}
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             return [self._redact(item) for item in value]
         return value
 
     def finish(self, handle):
         self.data["capture_errors"] = self._errors
         try:
-            payload = json.dumps(self._redact(self.data), ensure_ascii=False, indent=2,
-                                 default=self._json_value).encode("utf-8", errors="backslashreplace")
+            payload = self._encode(self.data)
         except (ValueError, TypeError, RecursionError) as exc:
             self._errors.append({"operation": "document", "error": type(exc).__name__})
             payload = None
-        if payload is not None and len(payload) + 1 <= _MAX_BYTES:
-            handle.write(payload + b"\n")
-        else:
+
+        if payload is None or len(payload) > _MAX_BYTES:
             if payload is not None:
                 self._errors.append({"operation": "document", "error": "DiagnosticSizeLimitExceeded"})
-            # Keep a readable failure record instead of a truncated document
-            # or one that appears to be a successful capture.
-            self._write(handle, self._redact({
-                key: [] if key in ("provider_calls", "tool_executions", "grounding") else value
-                for key, value in self.data.items()
-            }))
+            # Caller-supplied summaries must not prevent the recorder from saving the exchange.
+            capture = {key: value for key, value in self.data.items() if key in _CAPTURE_FIELDS}
+            payload = self._encode(capture)
+            if len(payload) > _MAX_BYTES:
+                for key in ("provider_calls", "tool_executions", "grounding", "length_recovery"):
+                    if key in capture:
+                        capture[key] = []
+                payload = self._encode(capture)
+
+        if len(payload) <= _MAX_BYTES:
+            handle.write(payload)
         handle.flush()
         if self._errors:
             raise DiagnosticCaptureError("LLM diagnostic capture incomplete; see capture_errors in the local file")

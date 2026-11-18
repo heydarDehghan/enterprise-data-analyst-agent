@@ -5,11 +5,15 @@ import hashlib
 import hmac
 import re
 import sqlite3
+from calendar import monthrange
 from contextlib import closing
+from datetime import date
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from fastapi import HTTPException, Request
+
+from app.month_scope import PurchaseDropScope
 
 
 class UnsafeQueryError(ValueError):
@@ -24,6 +28,27 @@ _ALLOWED_FUNCTIONS = frozenset(
     {"sum", "count", "avg", "min", "max", "coalesce", "substr", "lower", "upper", "length", "abs", "round"}
 )
 _MONTH = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])\Z")
+MAX_PURCHASE_DROP_ROWS = 5
+
+
+def purchase_drop_scope(baseline_month: str, comparison_month: str, limit: int) -> PurchaseDropScope:
+    if type(limit) is not int or not 1 <= limit <= MAX_PURCHASE_DROP_ROWS:
+        raise ValueError("Invalid purchase-drop limit")
+    months = baseline_month, comparison_month
+    if any(not isinstance(month, str) or not month.isascii() or not _MONTH.fullmatch(month)
+           for month in months):
+        raise ValueError("Expected Gregorian YYYY-MM months")
+    baseline, comparison = (date.fromisoformat(month + "-01") for month in months)
+    if baseline >= comparison:
+        raise ValueError("Baseline month must precede comparison month")
+
+    def window(first: date) -> tuple[str, str]:
+        last = first.replace(day=monthrange(first.year, first.month)[1])
+        return first.isoformat(), last.isoformat()
+
+    return PurchaseDropScope(
+        f"{baseline_month} to {comparison_month}", (window(baseline), window(comparison)), limit,
+    )
 
 
 def _mapped_path(data_dir: Path, name: str, suffix: str) -> Path:
@@ -257,6 +282,35 @@ class TenantContext:
         if len(rows) > self._max_rows:
             raise QueryLimitExceeded("SQL row limit exceeded")
         return [dict(row) for row in rows]
+
+    def customer_purchase_drops(
+        self, *, baseline_month: str, comparison_month: str, limit: int,
+    ) -> dict[str, object]:
+        scope = purchase_drop_scope(baseline_month, comparison_month, limit)
+        baseline, comparison = scope.month_windows
+        # Snapshot dates are ISO calendar days. Bind both complete windows independently.
+        rows = self.agent_query(
+            """
+            WITH monthly_totals AS (
+                SELECT customer_id,
+                    SUM(CASE WHEN order_date BETWEEN ?1 AND ?2 THEN amount_toman ELSE 0 END)
+                        AS baseline_revenue_toman,
+                    SUM(CASE WHEN order_date BETWEEN ?3 AND ?4 THEN amount_toman ELSE 0 END)
+                        AS comparison_revenue_toman
+                FROM paid_orders
+                WHERE order_date BETWEEN ?1 AND ?2 OR order_date BETWEEN ?3 AND ?4
+                GROUP BY customer_id
+            )
+            SELECT customer_id, baseline_revenue_toman, comparison_revenue_toman,
+                baseline_revenue_toman - comparison_revenue_toman AS decrease_toman
+            FROM monthly_totals
+            WHERE baseline_revenue_toman > comparison_revenue_toman
+            ORDER BY decrease_toman DESC, customer_id ASC
+            LIMIT ?5
+            """,
+            (*baseline, *comparison, scope.limit),
+        )
+        return {"baseline_month": baseline_month, "comparison_month": comparison_month, "rows": rows}
 
     def paid_revenue(self, month: str) -> int:
         if not isinstance(month, str) or not _MONTH.fullmatch(month):

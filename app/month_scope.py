@@ -15,8 +15,18 @@ _DEMO_MONTH_NAMES = {
 }
 _ISO_DATE = re.compile(r"\b[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}\b")
 _DEMO_MONTH_ID = re.compile(r"\b2026-(0[1-9]|1[0-2])\b")
+_NAMED_MONTHS = {name: month for month, names in _DEMO_MONTH_NAMES.items() for name in names}
+_MONTH_WORD = re.compile(
+    r"\b(?:" + "|".join(_NAMED_MONTHS)
+    + r"|january|february|march|april|may|june|july|november|december"
+    r"|ژانویه|فوریه|مارس|آوریل|مه|ژوئن|ژوئیه|ژولای|نوامبر|دسامبر)\b",
+    re.IGNORECASE,
+)
+_YEAR = re.compile(r"\b[0-9]{4}\b")
+_NON_GREGORIAN = re.compile(r"\b(?:هجری|شمسی|خورشیدی|قمری|hijri)\b", re.IGNORECASE)
+_PREVIOUS_REPORT_SUBJECT = r"عدد (?:دقیق )?گزارش قبلی را (?:با رقم )?"
 _PREVIOUS_REPORT_REQUEST = re.compile(
-    r"عدد (?:دقیق )?گزارش قبلی را (?:با رقم )?دوباره بگو"
+    _PREVIOUS_REPORT_SUBJECT + r"دوباره بگو"
     r"(?: و نمودار قبلی را نگه دار)?"
     r"(?:[.؟] برای slot عددی از همان شاهد execute_python و فیلد revenue استفاده کن)?[.؟]?",
 )
@@ -43,11 +53,100 @@ class MonthScope:
         )
 
 
+@dataclass(frozen=True)
+class ComparisonScope:
+    label: str
+    month_windows: tuple[tuple[str, str], ...]
+
+    @property
+    def first(self) -> str:
+        return min(window[0] for window in self.month_windows)
+
+    @property
+    def last(self) -> str:
+        return max(window[1] for window in self.month_windows)
+
+
+@dataclass(frozen=True)
+class PurchaseDropScope(ComparisonScope):
+    """A ranked decrease with baseline month first and comparison month second."""
+
+    month_windows: tuple[tuple[str, str], tuple[str, str]]
+    limit: int
+
+
 def _ascii_digits(text: str) -> str:
     return "".join(
         str(unicodedata.decimal(char)) if char.isdecimal() else char
         for char in text
     )
+
+
+def _month_window(month: int) -> tuple[str, str]:
+    start = date(2026, month, 1)
+    last = start.replace(day=calendar.monthrange(start.year, month)[1])
+    return start.isoformat(), last.isoformat()
+
+
+def _requested_three_months(question: str) -> ComparisonScope | None:
+    # Use the original offsets to keep the display label verbatim.
+    normalized = _ascii_digits(question)
+    names = list(_MONTH_WORD.finditer(normalized))
+    labels = [match[0].casefold() for match in names]
+    months = [_NAMED_MONTHS.get(label, 0) for label in labels]
+    if 0 in months or len(set(months)) != 3 or "شهریور" in labels:
+        return None
+    separator = r"(?:\s+2026)?(?:\s*[,،]\s*(?:(?:and|و)\s+)?|\s+(?:and|و)\s+)"
+    if any(re.fullmatch(separator, normalized[left.end():right.start()], re.IGNORECASE) is None
+           for left, right in zip(names, names[1:])):
+        return None
+    suffix = re.match(r"\s+(?:میلادی\s+)?2026\b(?![-./][0-9])(?:\s+میلادی\b)?", normalized[names[-1].end():])
+    if suffix is None:
+        return None
+    start, end = names[0].start(), names[-1].end() + suffix.end()
+    if _YEAR.search(normalized[:start] + " " + normalized[end:]):
+        return None
+    return ComparisonScope(question[start:end], tuple(_month_window(month) for month in months))
+
+
+def requested_comparison(question: str) -> ComparisonScope | None:
+    """Recognize an explicit pair or list of three named Gregorian demo months."""
+    display = " ".join(question.split())
+    normalized = _ascii_digits(display)
+    if re.search(r"\b" + _PREVIOUS_REPORT_SUBJECT + r"(?:دوباره )?بگو\b", normalized):
+        return None
+    names = list(_MONTH_WORD.finditer(normalized))
+    if _NON_GREGORIAN.search(normalized):
+        return None
+    if len(names) == 3:
+        return _requested_three_months(question)
+    if len(names) != 2:
+        return None
+    first, second = names
+    month_names = (first[0].casefold(), second[0].casefold())
+    first_month, second_month = (_NAMED_MONTHS.get(name) for name in month_names)
+    if first_month is None or second_month is None or "شهریور" in month_names or first_month == second_month:
+        return None
+
+    # A shared trailing year or the same explicit year on both named months.
+    between = normalized[first.end():second.start()]
+    suffix = re.match(r" (?:میلادی )?2026\b(?![-./][0-9])(?: میلادی\b)?", normalized[second.end():])
+    purchase_drop = (
+        between == " نسبت به " and (first_month, second_month) == (10, 9)
+        and normalized[:first.start()] == "5 مشتری با بیشترین افت مبلغ خرید در "
+    )
+    if suffix is None or (
+        not purchase_drop and not re.fullmatch(r" (?:2026 )?(?:و|(?:را )?با|and|with) ", between, re.IGNORECASE)
+    ):
+        return None
+    end = second.end() + suffix.end()
+    if _YEAR.search(normalized[:first.start()] + " " + normalized[end:]):
+        return None
+
+    label = display[first.start():end]
+    if purchase_drop:
+        return PurchaseDropScope(label, (_month_window(second_month), _month_window(first_month)), limit=5)
+    return ComparisonScope(label, (_month_window(first_month), _month_window(second_month)))
 
 
 def references_previous_report(question: str) -> bool:

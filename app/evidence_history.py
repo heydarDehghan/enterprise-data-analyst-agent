@@ -63,7 +63,7 @@ def encode_turn_evidence(
         digest = _result_digest(scope, index, message)
         if digest is None or message["content"] != json.dumps(record.result, ensure_ascii=False):
             continue
-        entry = json.dumps({
+        verified = {
             "step": step,
             "call_id": record.call_id,
             "tool": record.tool_name,
@@ -74,7 +74,10 @@ def encode_turn_evidence(
                        "column": source.column, "calculation": source.calculation}
                 for name, source in record.sql_provenance.items()
             },
-        }, separators=(",", ":"))
+        }
+        if record.ticket_customer_id is not None:
+            verified["ticket_customer_id"] = record.ticket_customer_id
+        entry = json.dumps(verified, separators=(",", ":"))
         if len(entry) + bool(proofs) <= budget:
             budget -= len(entry) + bool(proofs)
             proofs.append(entry)
@@ -121,10 +124,14 @@ def recover_turn_evidence(
                 for field, source in entry["fields"].items()
             }
             window = MonthScope(**entry["window"]) if entry["window"] is not None else None
+            ticket_customer_id = entry.get("ticket_customer_id")
+            if ticket_customer_id is not None and (name != "get_tickets" or type(ticket_customer_id) is not str):
+                continue
         except (KeyError, TypeError, ValueError, AttributeError, RecursionError):
             continue
         recovered.append(RecordedToolResult(
             scope, call_id, name, True, result, {field: source.kind for field, source in sources.items()},
             window, sources,
+            ticket_customer_id=ticket_customer_id,
         ))
     return recovered
